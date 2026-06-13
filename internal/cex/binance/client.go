@@ -64,93 +64,85 @@ func NewClient(baseURL string) *Client {
 	}
 }
 
-// EffectivePrices returns a Snapshot containing the raw top-of-book and the
-// slippage-aware effective per-unit price for each (size, side) combination
-// against the current orderbook for `symbol`.
+// EffectivePrices returns the slippage-aware effective per-unit price for
+// each (size, side) combination against the current orderbook for `symbol`.
+// Sizes must be in ascending order; the per-side processing relies on that
+// invariant to exit early on the first size that exceeds available depth.
 //
-// The Quotes slice has 2*len(sizes) entries — for each input size, one
+// The returned slice has 2*len(sizes) entries — for each input size, one
 // BUY (consuming asks) followed by one SELL (consuming bids), in input order.
 // Sizes that exceed available depth on a given side are returned with
 // Quote.Err set to ErrInsufficientDepth; the top-level error is returned
 // only if fetching the orderbook itself failed.
-func (c *Client) EffectivePrices(ctx context.Context, symbol Symbol, sizes []decimal.Decimal) (Snapshot, error) {
-	snap := Snapshot{Quotes: make([]Quote, 2*len(sizes))}
-	pending := make([]bool, 2*len(sizes))
-	for i := range pending {
-		pending[i] = true
-	}
+func (c *Client) EffectivePrices(ctx context.Context, symbol Symbol, sizes []decimal.Decimal) ([]Quote, error) {
+	// Per side, an output slice keyed by input-size index and a cursor for
+	// the first index still waiting for a fill. Because sizes are ascending
+	// and the book is monotonic, the first index that doesn't fit at a
+	// given tier implies every later index also fails at that tier — so a
+	// single integer per side captures the entire pending state.
+	buy := make([]Quote, len(sizes))
+	sell := make([]Quote, len(sizes))
+	buyFrom, sellFrom := 0, 0
 
-	// Pick the initial depth tier from the symbol's density estimate.
-	// Escalate to deeper tiers only for (size, side) combinations that
-	// still report insufficient depth — successful answers from earlier
-	// tiers are kept, not recomputed.
 	initialLimit := pickDepthLimit(symbol, sizes)
-	firstFetch := true
 	for _, limit := range depthLimitTiers {
 		if limit < initialLimit {
 			continue
 		}
+		if buyFrom == len(sizes) && sellFrom == len(sizes) {
+			break
+		}
 		bids, asks, err := c.fetchDepth(ctx, symbol.Code, limit)
 		if err != nil {
-			return Snapshot{}, err
+			return nil, err
 		}
-		if firstFetch {
-			snap.BestBid = topPrice(bids)
-			snap.BestAsk = topPrice(asks)
-			firstFetch = false
-		}
-		anyPending := false
-		for i, sz := range sizes {
-			tryResolve(snap.Quotes, pending, 2*i, sz, Buy, asks)
-			tryResolve(snap.Quotes, pending, 2*i+1, sz, Sell, bids)
-			if pending[2*i] || pending[2*i+1] {
-				anyPending = true
-			}
-		}
-		if !anyPending {
-			return snap, nil
-		}
+		buyFrom = fillSide(buy, sizes, buyFrom, asks, Buy)
+		sellFrom = fillSide(sell, sizes, sellFrom, bids, Sell)
 	}
-	// Anything still pending after the deepest tier is genuinely beyond
-	// the orderbook's available depth.
-	for i, sz := range sizes {
-		if pending[2*i] {
-			snap.Quotes[2*i] = Quote{Size: sz, Side: Buy, Err: ErrInsufficientDepth}
-		}
-		if pending[2*i+1] {
-			snap.Quotes[2*i+1] = Quote{Size: sz, Side: Sell, Err: ErrInsufficientDepth}
-		}
-	}
-	return snap, nil
+	markInsufficient(buy, sizes, buyFrom, Buy)
+	markInsufficient(sell, sizes, sellFrom, Sell)
+
+	return interleave(buy, sell), nil
 }
 
-// tryResolve attempts to compute the quote at the given index against the
-// supplied levels. If the walk succeeds, or fails with a non-depth error,
-// the result is recorded in out[idx] and pending[idx] is cleared. If the
-// walk fails with ErrInsufficientDepth, the slot is left pending so a deeper
-// tier can retry it.
-func tryResolve(out []Quote, pending []bool, idx int, size decimal.Decimal, side Side, levels []level) {
-	if !pending[idx] {
-		return
+// fillSide walks `levels` for sizes[from:] in ascending order, writing the
+// resulting Quote into out[i]. It returns the index of the first size that
+// did not fit — because sizes are ascending, every larger size will also
+// have failed at this tier and must be retried at a deeper one.
+func fillSide(out []Quote, sizes []decimal.Decimal, from int, levels []level, side Side) int {
+	for i := from; i < len(sizes); i++ {
+		price, _, err := walkOrderbook(levels, sizes[i])
+		if err == nil {
+			out[i] = Quote{Size: sizes[i], Side: side, Price: price}
+			continue
+		}
+		if errors.Is(err, ErrInsufficientDepth) {
+			return i
+		}
+		// Non-depth error (e.g., invalid size). Record and continue with
+		// the rest of the sizes — the book itself is still usable.
+		out[i] = Quote{Size: sizes[i], Side: side, Err: err}
 	}
-	price, _, err := walkOrderbook(levels, size)
-	if err == nil {
-		out[idx] = Quote{Size: size, Side: side, Price: price}
-		pending[idx] = false
-		return
-	}
-	if !errors.Is(err, ErrInsufficientDepth) {
-		out[idx] = Quote{Size: size, Side: side, Err: err}
-		pending[idx] = false
+	return len(sizes)
+}
+
+// markInsufficient fills out[from:] with ErrInsufficientDepth quotes for the
+// sizes that remained pending after the deepest fetched tier.
+func markInsufficient(out []Quote, sizes []decimal.Decimal, from int, side Side) {
+	for i := from; i < len(sizes); i++ {
+		out[i] = Quote{Size: sizes[i], Side: side, Err: ErrInsufficientDepth}
 	}
 }
 
-// topPrice returns the first level's price, or decimal.Zero if levels is empty.
-func topPrice(levels []level) decimal.Decimal {
-	if len(levels) == 0 {
-		return decimal.Zero
+// interleave merges the per-side results into the [Buy, Sell, Buy, Sell, ...]
+// layout EffectivePrices returns. buy and sell must have equal length.
+func interleave(buy, sell []Quote) []Quote {
+	out := make([]Quote, 2*len(buy))
+	for i := range buy {
+		out[2*i] = buy[i]
+		out[2*i+1] = sell[i]
 	}
-	return levels[0].price
+	return out
 }
 
 // fetchDepth fetches the orderbook for `symbol` with at most `limit` levels

@@ -45,17 +45,6 @@ type Quote struct {
 	Err   error
 }
 
-// Snapshot is the unit a Client returns from a single EffectivePrices call:
-// the raw top-of-book at the moment of fetch, and the slippage-aware effective
-// quotes for the requested (size, side) combinations. BestBid / BestAsk are
-// the first-level prices observed in the initial fetch; they are zero only
-// when the corresponding side was empty in that fetch.
-type Snapshot struct {
-	BestBid decimal.Decimal
-	BestAsk decimal.Decimal
-	Quotes  []Quote
-}
-
 // ErrInsufficientDepth is returned (via Quote.Err) when the orderbook does
 // not contain enough liquidity to fill the requested trade size on a given side.
 var ErrInsufficientDepth = errors.New("insufficient orderbook depth")

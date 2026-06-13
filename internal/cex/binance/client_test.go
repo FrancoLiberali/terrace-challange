@@ -36,20 +36,12 @@ func TestClient_EffectivePrices(t *testing.T) {
 	defer srv.Close()
 
 	client := NewClient(srv.URL)
-	snap, err := client.EffectivePrices(context.Background(), SymbolETHUSDC, []decimal.Decimal{dec("1"), dec("10")})
+	quotes, err := client.EffectivePrices(context.Background(), SymbolETHUSDC, []decimal.Decimal{dec("1"), dec("10")})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// Snapshot must carry the raw top-of-book from the initial fetch.
-	if !snap.BestBid.Equal(dec("2249.50")) {
-		t.Errorf("BestBid: got %s, want 2249.50", snap.BestBid)
-	}
-	if !snap.BestAsk.Equal(dec("2250.10")) {
-		t.Errorf("BestAsk: got %s, want 2250.10", snap.BestAsk)
-	}
-
-	if got, want := len(snap.Quotes), 4; got != want {
+	if got, want := len(quotes), 4; got != want {
 		t.Fatalf("quotes: got %d, want %d", got, want)
 	}
 
@@ -71,7 +63,7 @@ func TestClient_EffectivePrices(t *testing.T) {
 		{3, "10", Sell, "2249.482", "10 ETH SELL"},
 	}
 	for _, c := range checks {
-		q := snap.Quotes[c.idx]
+		q := quotes[c.idx]
 		if !q.Size.Equal(dec(c.wantSize)) {
 			t.Errorf("%s: size got %s, want %s", c.comment, q.Size, c.wantSize)
 		}
@@ -128,21 +120,21 @@ func TestClient_EffectivePrices_PerRowInsufficientDepth(t *testing.T) {
 			defer srv.Close()
 
 			client := NewClient(srv.URL)
-			snap, err := client.EffectivePrices(context.Background(), SymbolETHUSDC, []decimal.Decimal{dec("10")})
+			quotes, err := client.EffectivePrices(context.Background(), SymbolETHUSDC, []decimal.Decimal{dec("10")})
 			if err != nil {
 				t.Fatalf("unexpected top-level error: %v", err)
 			}
-			if len(snap.Quotes) != 2 {
-				t.Fatalf("expected 2 quotes, got %d", len(snap.Quotes))
+			if len(quotes) != 2 {
+				t.Fatalf("expected 2 quotes, got %d", len(quotes))
 			}
-			fail := snap.Quotes[tc.failIdx]
+			fail := quotes[tc.failIdx]
 			if !errors.Is(fail.Err, ErrInsufficientDepth) {
 				t.Errorf("%s side: expected ErrInsufficientDepth, got %v", tc.wantFailureSide, fail.Err)
 			}
 			if fail.Side != tc.wantFailureSide {
 				t.Errorf("failing slot side: got %v, want %v", fail.Side, tc.wantFailureSide)
 			}
-			succ := snap.Quotes[tc.succIdx]
+			succ := quotes[tc.succIdx]
 			if succ.Err != nil {
 				t.Errorf("%s side: expected success, got %v", tc.wantSuccessSide, succ.Err)
 			}
@@ -207,12 +199,11 @@ func TestPickDepthLimit(t *testing.T) {
 }
 
 // TestClient_EffectivePrices_EscalatesAndPreservesSuccessfulQuotes verifies
-// three behaviours at once:
+// two behaviours at once:
 //   - the initial heuristic tier is escalated to a deeper tier when the
 //     orderbook turns out thinner than the per-pair density assumed;
 //   - quotes that succeeded at the initial tier are NOT recomputed against
-//     the deeper-tier data (their per-unit price stays as the first answer);
-//   - the Snapshot's BestBid/BestAsk reflect the initial fetch, not later tiers.
+//     the deeper-tier data (their per-unit price stays as the first answer).
 //
 // We provoke this by configuring an overly optimistic per-pair density so
 // pickDepthLimit picks tier 100, then have the test server return only 50 ETH
@@ -239,7 +230,7 @@ func TestClient_EffectivePrices_EscalatesAndPreservesSuccessfulQuotes(t *testing
 	// levels needed, so picks the smallest tier (100).
 	sym := Symbol{Code: "ETHUSDC", EstLiquidityPerLevel: decimal.NewFromInt(10)}
 	client := NewClient(srv.URL)
-	snap, err := client.EffectivePrices(context.Background(), sym, []decimal.Decimal{dec("1"), dec("200")})
+	quotes, err := client.EffectivePrices(context.Background(), sym, []decimal.Decimal{dec("1"), dec("200")})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -254,29 +245,21 @@ func TestClient_EffectivePrices_EscalatesAndPreservesSuccessfulQuotes(t *testing
 		t.Errorf("requested limits: got %v, want %v", requested, want)
 	}
 
-	// BestBid/BestAsk come from the FIRST fetch, not the later tier.
-	if !snap.BestBid.Equal(dec("2249")) {
-		t.Errorf("BestBid: got %s, want 2249 (from initial tier)", snap.BestBid)
-	}
-	if !snap.BestAsk.Equal(dec("2250")) {
-		t.Errorf("BestAsk: got %s, want 2250 (from initial tier)", snap.BestAsk)
-	}
-
 	// quotes[0] = Buy 1 — succeeded at tier 100; should still report 2250.
-	if !snap.Quotes[0].Price.Equal(dec("2250")) {
-		t.Errorf("Buy 1: got %s, want 2250 (preserved from tier 100)", snap.Quotes[0].Price)
+	if !quotes[0].Price.Equal(dec("2250")) {
+		t.Errorf("Buy 1: got %s, want 2250 (preserved from tier 100)", quotes[0].Price)
 	}
 	// quotes[1] = Sell 1 — same.
-	if !snap.Quotes[1].Price.Equal(dec("2249")) {
-		t.Errorf("Sell 1: got %s, want 2249 (preserved from tier 100)", snap.Quotes[1].Price)
+	if !quotes[1].Price.Equal(dec("2249")) {
+		t.Errorf("Sell 1: got %s, want 2249 (preserved from tier 100)", quotes[1].Price)
 	}
 	// quotes[2] = Buy 200 — failed at tier 100, succeeded at tier 500.
-	if !snap.Quotes[2].Price.Equal(dec("3000")) {
-		t.Errorf("Buy 200: got %s, want 3000 (from tier 500 after escalation)", snap.Quotes[2].Price)
+	if !quotes[2].Price.Equal(dec("3000")) {
+		t.Errorf("Buy 200: got %s, want 3000 (from tier 500 after escalation)", quotes[2].Price)
 	}
 	// quotes[3] = Sell 200 — same.
-	if !snap.Quotes[3].Price.Equal(dec("2999")) {
-		t.Errorf("Sell 200: got %s, want 2999 (from tier 500 after escalation)", snap.Quotes[3].Price)
+	if !quotes[3].Price.Equal(dec("2999")) {
+		t.Errorf("Sell 200: got %s, want 2999 (from tier 500 after escalation)", quotes[3].Price)
 	}
 }
 

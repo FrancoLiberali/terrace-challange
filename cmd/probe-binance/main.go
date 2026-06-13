@@ -35,31 +35,26 @@ func run() error {
 	defer cancel()
 
 	client := binance.NewClient(binance.DefaultBaseURL)
-	snap, err := client.EffectivePrices(ctx, binance.SymbolETHUSDC, tradeSizes)
+	quotes, err := client.EffectivePrices(ctx, binance.SymbolETHUSDC, tradeSizes)
 	if err != nil {
 		return fmt.Errorf("fetch effective prices: %w", err)
 	}
-	printSnapshot(os.Stdout, tradeSizes, snap)
+	printQuotes(os.Stdout, tradeSizes, quotes)
 	return nil
 }
 
-// printSnapshot renders the raw top-of-book and the per-size effective prices.
-// The Quotes slice is laid out as interleaved Buy/Sell rows by size (the order
-// EffectivePrices guarantees), so a direct indexed loop is enough.
-func printSnapshot(w io.Writer, sizes []decimal.Decimal, snap binance.Snapshot) {
-	fmt.Fprintln(w, "Binance ETH-USDC")
-	fmt.Fprintf(w, "  top of book: bid $%s / ask $%s (spread $%s)\n",
-		snap.BestBid.StringFixed(2),
-		snap.BestAsk.StringFixed(2),
-		snap.BestAsk.Sub(snap.BestBid).StringFixed(2),
-	)
-	fmt.Fprintln(w, "  effective prices (slippage-aware):")
-	fmt.Fprintf(w, "    %-14s   %-22s   %-22s\n", "Size", "BUY (eat asks)", "SELL (eat bids)")
+// printQuotes renders the per-size effective prices. The Quotes slice is laid
+// out as interleaved Buy/Sell rows by size (the order EffectivePrices
+// guarantees), so a direct indexed loop is enough. The smallest configured
+// size effectively reads the top of the book.
+func printQuotes(w io.Writer, sizes []decimal.Decimal, quotes []binance.Quote) {
+	fmt.Fprintln(w, "Binance ETH-USDC effective prices (slippage-aware):")
+	fmt.Fprintf(w, "  %-14s   %-22s   %-22s\n", "Size", "BUY (eat asks)", "SELL (eat bids)")
 	for i, sz := range sizes {
-		fmt.Fprintf(w, "    %-14s   %-22s   %-22s\n",
+		fmt.Fprintf(w, "  %-14s   %-22s   %-22s\n",
 			sz.String()+" ETH",
-			formatQuote(snap.Quotes[2*i]),
-			formatQuote(snap.Quotes[2*i+1]),
+			formatQuote(quotes[2*i]),
+			formatQuote(quotes[2*i+1]),
 		)
 	}
 }
