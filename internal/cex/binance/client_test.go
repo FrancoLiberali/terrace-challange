@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"github.com/shopspring/decimal"
+
+	"github.com/FrancoLiberali/terrace-challenge/internal/pricing"
 )
 
 func TestClient_EffectivePrices(t *testing.T) {
@@ -50,20 +52,20 @@ func TestClient_EffectivePrices(t *testing.T) {
 
 	// Buy[i] and Sell[i] correspond to sizes[i].
 	checks := []struct {
-		q         Quote
+		q         pricing.Quote
 		wantSize  string
-		wantSide  Side
+		wantSide  pricing.Side
 		wantPrice string
 		comment   string
 	}{
 		// 1 ETH BUY eats the lowest ask: 1 ETH at 2250.10 → 2250.10
-		{quotes.Buy[0], "1", Buy, "2250.10", "1 ETH BUY"},
+		{quotes.Buy[0], "1", pricing.Buy, "2250.10", "1 ETH BUY"},
 		// 1 ETH SELL eats the highest bid: 1 ETH at 2249.50 → 2249.50
-		{quotes.Sell[0], "1", Sell, "2249.50", "1 ETH SELL"},
+		{quotes.Sell[0], "1", pricing.Sell, "2249.50", "1 ETH SELL"},
 		// 10 ETH BUY: 3.5 at 2250.10 + 6.5 at 2250.20 = 22501.65 → /10 = 2250.165
-		{quotes.Buy[1], "10", Buy, "2250.165", "10 ETH BUY"},
+		{quotes.Buy[1], "10", pricing.Buy, "2250.165", "10 ETH BUY"},
 		// 10 ETH SELL: 8.2 at 2249.50 (18445.90) + 1.8 at 2249.40 (4048.92) = 22494.82 → /10 = 2249.482
-		{quotes.Sell[1], "10", Sell, "2249.482", "10 ETH SELL"},
+		{quotes.Sell[1], "10", pricing.Sell, "2249.482", "10 ETH SELL"},
 	}
 	for _, c := range checks {
 		if !c.q.Size.Equal(dec(c.wantSize)) {
@@ -90,22 +92,22 @@ func TestClient_EffectivePrices_PerRowInsufficientDepth(t *testing.T) {
 	cases := []struct {
 		name      string
 		body      string
-		failSide  Side
-		succSide  Side
+		failSide  pricing.Side
+		succSide  pricing.Side
 		succPrice string
 	}{
 		{
 			name:      "buy fails / sell succeeds",
 			body:      `{"lastUpdateId":1,"bids":[["2249.50","12.0"]],"asks":[["2250.10","2.0"]]}`,
-			failSide:  Buy,
-			succSide:  Sell,
+			failSide:  pricing.Buy,
+			succSide:  pricing.Sell,
 			succPrice: "2249.50",
 		},
 		{
 			name:      "sell fails / buy succeeds",
 			body:      `{"lastUpdateId":1,"bids":[["2249.50","2.0"]],"asks":[["2250.10","12.0"]]}`,
-			failSide:  Sell,
-			succSide:  Buy,
+			failSide:  pricing.Sell,
+			succSide:  pricing.Buy,
 			succPrice: "2250.10",
 		},
 	}
@@ -125,7 +127,7 @@ func TestClient_EffectivePrices_PerRowInsufficientDepth(t *testing.T) {
 				t.Fatalf("expected one Buy and one Sell quote, got %d/%d", len(quotes.Buy), len(quotes.Sell))
 			}
 			fail, succ := quotes.Buy[0], quotes.Sell[0]
-			if tc.failSide == Sell {
+			if tc.failSide == pricing.Sell {
 				fail, succ = quotes.Sell[0], quotes.Buy[0]
 			}
 			if !errors.Is(fail.Err, ErrInsufficientDepth) {
@@ -257,6 +259,65 @@ func TestClient_EffectivePrices_EscalatesAndPreservesSuccessfulQuotes(t *testing
 	}
 	if !quotes.Sell[1].Price.Equal(dec("2999")) {
 		t.Errorf("Sell 200: got %s, want 2999 (from tier 500 after escalation)", quotes.Sell[1].Price)
+	}
+}
+
+func TestClient_EffectivePrices_EmptySizes(t *testing.T) {
+	// No HTTP traffic should happen — there's no work to do — and both
+	// returned slices should be empty (not nil-failure-prone).
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		t.Error("server should not be hit when sizes is empty")
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL)
+	quotes, err := client.EffectivePrices(context.Background(), SymbolETHUSDC, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(quotes.Buy) != 0 || len(quotes.Sell) != 0 {
+		t.Errorf("empty input: got Buy=%d Sell=%d, want 0/0", len(quotes.Buy), len(quotes.Sell))
+	}
+}
+
+func TestClient_EffectivePrices_NonPositiveSize_RecordsErr(t *testing.T) {
+	// walkOrderbook rejects non-positive sizes with a non-depth error, which
+	// fillSide records on the Quote rather than propagating up. Verifies the
+	// public API tolerates a bad-input edge without panicking or short-
+	// circuiting the rest of the work.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"lastUpdateId":1,"bids":[["2249","10"]],"asks":[["2250","10"]]}`))
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL)
+	quotes, err := client.EffectivePrices(context.Background(), SymbolETHUSDC, []decimal.Decimal{dec("0")})
+	if err != nil {
+		t.Fatalf("unexpected top-level error: %v", err)
+	}
+	if quotes.Buy[0].Err == nil {
+		t.Errorf("Buy: expected Err for size=0, got nil")
+	}
+	if errors.Is(quotes.Buy[0].Err, ErrInsufficientDepth) {
+		t.Errorf("Buy: non-positive size should NOT be reported as insufficient depth, got %v", quotes.Buy[0].Err)
+	}
+	if quotes.Sell[0].Err == nil {
+		t.Errorf("Sell: expected Err for size=0, got nil")
+	}
+}
+
+func TestParseDepthResponse_RejectsMalformedJSON(t *testing.T) {
+	// Top-level JSON corruption (not just per-level number parsing).
+	cases := []string{
+		``,
+		`not json`,
+		`{"bids":`,
+		`{"bids":"not-an-array","asks":[]}`,
+	}
+	for _, body := range cases {
+		if _, _, err := parseDepthResponse(strings.NewReader(body)); err == nil {
+			t.Errorf("expected error for malformed JSON %q, got nil", body)
+		}
 	}
 }
 

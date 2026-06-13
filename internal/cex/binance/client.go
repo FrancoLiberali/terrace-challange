@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/shopspring/decimal"
+
+	"github.com/FrancoLiberali/terrace-challenge/internal/pricing"
 )
 
 // DefaultBaseURL is the production Binance Spot API endpoint.
@@ -73,15 +75,15 @@ func NewClient(baseURL string) *Client {
 // that exceed available depth on a given side are returned with
 // Quote.Err set to ErrInsufficientDepth; the top-level error is returned
 // only if fetching the orderbook itself failed.
-func (c *Client) EffectivePrices(ctx context.Context, symbol Symbol, sizes []decimal.Decimal) (Quotes, error) {
+func (c *Client) EffectivePrices(ctx context.Context, symbol Symbol, sizes []decimal.Decimal) (pricing.Quotes, error) {
 	// Per side, an output slice keyed by input-size index and a cursor for
 	// the first index still waiting for a fill. Because sizes are ascending
 	// and the book is monotonic, the first index that doesn't fit at a
 	// given tier implies every later index also fails at that tier — so a
 	// single integer per side captures the entire pending state.
-	out := Quotes{
-		Buy:  make([]Quote, len(sizes)),
-		Sell: make([]Quote, len(sizes)),
+	out := pricing.Quotes{
+		Buy:  make([]pricing.Quote, len(sizes)),
+		Sell: make([]pricing.Quote, len(sizes)),
 	}
 	buyFrom, sellFrom := 0, 0
 
@@ -95,13 +97,13 @@ func (c *Client) EffectivePrices(ctx context.Context, symbol Symbol, sizes []dec
 		}
 		bids, asks, err := c.fetchDepth(ctx, symbol.Code, limit)
 		if err != nil {
-			return Quotes{}, err
+			return pricing.Quotes{}, err
 		}
-		buyFrom = fillSide(out.Buy, sizes, buyFrom, asks, Buy)
-		sellFrom = fillSide(out.Sell, sizes, sellFrom, bids, Sell)
+		buyFrom = fillSide(out.Buy, sizes, buyFrom, asks, pricing.Buy)
+		sellFrom = fillSide(out.Sell, sizes, sellFrom, bids, pricing.Sell)
 	}
-	markInsufficient(out.Buy, sizes, buyFrom, Buy)
-	markInsufficient(out.Sell, sizes, sellFrom, Sell)
+	markInsufficient(out.Buy, sizes, buyFrom, pricing.Buy)
+	markInsufficient(out.Sell, sizes, sellFrom, pricing.Sell)
 
 	return out, nil
 }
@@ -110,11 +112,11 @@ func (c *Client) EffectivePrices(ctx context.Context, symbol Symbol, sizes []dec
 // resulting Quote into out[i]. It returns the index of the first size that
 // did not fit — because sizes are ascending, every larger size will also
 // have failed at this tier and must be retried at a deeper one.
-func fillSide(out []Quote, sizes []decimal.Decimal, from int, levels []level, side Side) int {
+func fillSide(out []pricing.Quote, sizes []decimal.Decimal, from int, levels []level, side pricing.Side) int {
 	for i := from; i < len(sizes); i++ {
 		price, _, err := walkOrderbook(levels, sizes[i])
 		if err == nil {
-			out[i] = Quote{Size: sizes[i], Side: side, Price: price}
+			out[i] = pricing.Quote{Size: sizes[i], Side: side, Price: price}
 			continue
 		}
 		if errors.Is(err, ErrInsufficientDepth) {
@@ -122,16 +124,16 @@ func fillSide(out []Quote, sizes []decimal.Decimal, from int, levels []level, si
 		}
 		// Non-depth error (e.g., invalid size). Record and continue with
 		// the rest of the sizes — the book itself is still usable.
-		out[i] = Quote{Size: sizes[i], Side: side, Err: err}
+		out[i] = pricing.Quote{Size: sizes[i], Side: side, Err: err}
 	}
 	return len(sizes)
 }
 
 // markInsufficient fills out[from:] with ErrInsufficientDepth quotes for the
 // sizes that remained pending after the deepest fetched tier.
-func markInsufficient(out []Quote, sizes []decimal.Decimal, from int, side Side) {
+func markInsufficient(out []pricing.Quote, sizes []decimal.Decimal, from int, side pricing.Side) {
 	for i := from; i < len(sizes); i++ {
-		out[i] = Quote{Size: sizes[i], Side: side, Err: ErrInsufficientDepth}
+		out[i] = pricing.Quote{Size: sizes[i], Side: side, Err: ErrInsufficientDepth}
 	}
 }
 
