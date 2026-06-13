@@ -137,7 +137,7 @@ func markInsufficient(out []Quote, sizes []decimal.Decimal, from int, side Side)
 // interleave merges the per-side results into the [Buy, Sell, Buy, Sell, ...]
 // layout EffectivePrices returns. buy and sell must have equal length.
 func interleave(buy, sell []Quote) []Quote {
-	out := make([]Quote, 2*len(buy))
+	out := make([]Quote, 2*len(buy)) //nolint:mnd // 2 = Buy+Sell sides per input size
 	for i := range buy {
 		out[2*i] = buy[i]
 		out[2*i+1] = sell[i]
@@ -174,7 +174,7 @@ type depthResponse struct {
 
 func parseDepthResponse(r io.Reader) (bids, asks []level, err error) {
 	var d depthResponse
-	if err := json.NewDecoder(r).Decode(&d); err != nil {
+	if err = json.NewDecoder(r).Decode(&d); err != nil {
 		return nil, nil, fmt.Errorf("decode depth response: %w", err)
 	}
 	bids, err = parseLevels(d.Bids)

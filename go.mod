@@ -1,4 +1,4 @@
-module github.com/FrancoLiberali/terrace-challange
+module github.com/FrancoLiberali/terrace-challenge
 
 go 1.25.5
 

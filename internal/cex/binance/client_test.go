@@ -114,7 +114,7 @@ func TestClient_EffectivePrices_PerRowInsufficientDepth(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				_, _ = w.Write([]byte(tc.body))
 			}))
 			defer srv.Close()
@@ -149,7 +149,7 @@ func TestClient_EffectivePrices_PerRowInsufficientDepth(t *testing.T) {
 }
 
 func TestClient_EffectivePrices_NonOKStatus(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = w.Write([]byte(`{"code":-1100,"msg":"bad symbol"}`))
 	}))
@@ -199,7 +199,7 @@ func TestPickDepthLimit(t *testing.T) {
 }
 
 // TestClient_EffectivePrices_EscalatesAndPreservesSuccessfulQuotes verifies
-// two behaviours at once:
+// two behaviors at once:
 //   - the initial heuristic tier is escalated to a deeper tier when the
 //     orderbook turns out thinner than the per-pair density assumed;
 //   - quotes that succeeded at the initial tier are NOT recomputed against

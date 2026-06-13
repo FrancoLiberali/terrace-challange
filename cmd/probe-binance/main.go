@@ -12,8 +12,9 @@ import (
 	"os"
 	"time"
 
-	"github.com/FrancoLiberali/terrace-challange/internal/cex/binance"
 	"github.com/shopspring/decimal"
+
+	"github.com/FrancoLiberali/terrace-challenge/internal/cex/binance"
 )
 
 const requestTimeout = 10 * time.Second

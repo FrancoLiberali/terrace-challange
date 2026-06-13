@@ -17,9 +17,12 @@ import (
 // The zero value is intentionally invalid so an unset Side is detectable.
 type Side int
 
+// Buy consumes the ask side (lifts offers); Sell consumes the bid side
+// (hits bids). The constants start at 1 so the zero value of Side reads as
+// UNKNOWN rather than a silent Buy.
 const (
-	Buy  Side = iota + 1 // consumes asks (lifts offers)
-	Sell                 // consumes bids (hits bids)
+	Buy Side = iota + 1
+	Sell
 )
 
 // String returns a human-readable name for the side.
