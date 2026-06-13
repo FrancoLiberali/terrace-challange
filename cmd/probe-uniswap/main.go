@@ -18,6 +18,7 @@ import (
 	"github.com/shopspring/decimal"
 
 	"github.com/FrancoLiberali/terrace-challenge/internal/dex/uniswapv3"
+	"github.com/FrancoLiberali/terrace-challenge/internal/pricing"
 )
 
 const requestTimeout = 20 * time.Second
@@ -64,7 +65,7 @@ func run() error {
 // printQuotes renders the per-size effective prices. Buy[i] and Sell[i]
 // correspond to sizes[i]. The smallest configured size effectively reads
 // the pool's spot price (modulo the 0.3% fee).
-func printQuotes(w io.Writer, sizes []decimal.Decimal, quotes uniswapv3.Quotes) {
+func printQuotes(w io.Writer, sizes []decimal.Decimal, quotes pricing.Quotes) {
 	fmt.Fprintln(w, "Uniswap V3 ETH-USDC (0.3% pool) effective prices (slippage-aware):")
 	fmt.Fprintf(w, "  %-14s   %-22s   %-22s\n", "Size", "BUY (USDC→ETH)", "SELL (ETH→USDC)")
 	for i, sz := range sizes {
@@ -76,7 +77,7 @@ func printQuotes(w io.Writer, sizes []decimal.Decimal, quotes uniswapv3.Quotes) 
 	}
 }
 
-func formatQuote(q uniswapv3.Quote) string {
+func formatQuote(q pricing.Quote) string {
 	if q.Err != nil {
 		return "error: " + q.Err.Error()
 	}

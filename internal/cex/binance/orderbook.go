@@ -13,53 +13,9 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-// Side identifies which side of an orderbook a trade consumes.
-// The zero value is intentionally invalid so an unset Side is detectable.
-type Side int
-
-// Buy consumes the ask side (lifts offers); Sell consumes the bid side
-// (hits bids). The constants start at 1 so the zero value of Side reads as
-// UNKNOWN rather than a silent Buy.
-const (
-	Buy Side = iota + 1
-	Sell
-)
-
-// String returns a human-readable name for the side.
-func (s Side) String() string {
-	switch s {
-	case Buy:
-		return "BUY"
-	case Sell:
-		return "SELL"
-	default:
-		return "UNKNOWN"
-	}
-}
-
-// Quote is the slippage-aware effective per-unit price for a single
-// (size, side) query against an orderbook snapshot. If Err is non-nil,
-// Price is zero and the caller should treat this row as "no value at this
-// size and side."
-type Quote struct {
-	Size  decimal.Decimal
-	Side  Side
-	Price decimal.Decimal // quote-token per unit base
-	Err   error
-}
-
-// Quotes holds the slippage-aware results from one EffectivePrices call,
-// organized by side. Buy[i] and Sell[i] correspond to the i-th element of
-// the input sizes slice — Buy[i] consumes the ask side at sizes[i],
-// Sell[i] consumes the bid side at sizes[i]. Both slices always have
-// len(sizes) entries.
-type Quotes struct {
-	Buy  []Quote
-	Sell []Quote
-}
-
-// ErrInsufficientDepth is returned (via Quote.Err) when the orderbook does
-// not contain enough liquidity to fill the requested trade size on a given side.
+// ErrInsufficientDepth is returned (via pricing.Quote.Err) when the
+// orderbook does not contain enough liquidity to fill the requested trade
+// size on a given side.
 var ErrInsufficientDepth = errors.New("insufficient orderbook depth")
 
 // level is one price/size point in an orderbook. Internal representation.

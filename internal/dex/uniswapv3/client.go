@@ -11,6 +11,8 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/shopspring/decimal"
+
+	"github.com/FrancoLiberali/terrace-challenge/internal/pricing"
 )
 
 // QuoterV2Address is the deployed QuoterV2 contract on Ethereum mainnet.
@@ -56,10 +58,10 @@ func (c *Client) Close() { c.eth.Close() }
 // Per-row failures (e.g., the pool reverting because it cannot service the
 // requested size) are recorded in Quote.Err; the top-level error is
 // returned only if the input cannot be processed at all.
-func (c *Client) EffectivePrices(ctx context.Context, pool Pool, sizes []decimal.Decimal) (Quotes, error) {
-	out := Quotes{
-		Buy:  make([]Quote, len(sizes)),
-		Sell: make([]Quote, len(sizes)),
+func (c *Client) EffectivePrices(ctx context.Context, pool Pool, sizes []decimal.Decimal) (pricing.Quotes, error) {
+	out := pricing.Quotes{
+		Buy:  make([]pricing.Quote, len(sizes)),
+		Sell: make([]pricing.Quote, len(sizes)),
 	}
 	for i, size := range sizes {
 		out.Buy[i] = c.quoteBuy(ctx, pool, size)
@@ -88,8 +90,8 @@ type exactOutputParams struct {
 
 // quoteSell simulates sending `size` Base units and computes the
 // effective per-unit Quote price from the resulting amountOut.
-func (c *Client) quoteSell(ctx context.Context, pool Pool, size decimal.Decimal) Quote {
-	return c.quote(ctx, Sell, size, pool.Quote.Decimals, "quoteExactInputSingle", exactInputParams{
+func (c *Client) quoteSell(ctx context.Context, pool Pool, size decimal.Decimal) pricing.Quote {
+	return c.quote(ctx, pricing.Sell, size, pool.Quote.Decimals, "quoteExactInputSingle", exactInputParams{
 		TokenIn:           pool.Base.Address,
 		TokenOut:          pool.Quote.Address,
 		AmountIn:          toRawAmount(size, pool.Base.Decimals),
@@ -101,8 +103,8 @@ func (c *Client) quoteSell(ctx context.Context, pool Pool, size decimal.Decimal)
 // quoteBuy simulates the Quote token cost of receiving exactly `size`
 // Base units and computes the effective per-unit Quote price from the
 // resulting amountIn.
-func (c *Client) quoteBuy(ctx context.Context, pool Pool, size decimal.Decimal) Quote {
-	return c.quote(ctx, Buy, size, pool.Quote.Decimals, "quoteExactOutputSingle", exactOutputParams{
+func (c *Client) quoteBuy(ctx context.Context, pool Pool, size decimal.Decimal) pricing.Quote {
+	return c.quote(ctx, pricing.Buy, size, pool.Quote.Decimals, "quoteExactOutputSingle", exactOutputParams{
 		TokenIn:           pool.Quote.Address,
 		TokenOut:          pool.Base.Address,
 		Amount:            toRawAmount(size, pool.Base.Decimals),
@@ -116,17 +118,17 @@ func (c *Client) quoteBuy(ctx context.Context, pool Pool, size decimal.Decimal) 
 // exactInput, amountIn for exactOutput) in the same first output slot, so
 // both directions reduce to "first big.Int divided by size, denominated in
 // quote decimals."
-func (c *Client) quote(ctx context.Context, side Side, size decimal.Decimal, quoteDecimals uint8, method string, params any) Quote {
+func (c *Client) quote(ctx context.Context, side pricing.Side, size decimal.Decimal, quoteDecimals uint8, method string, params any) pricing.Quote {
 	raw, err := c.call(ctx, method, params)
 	if err != nil {
-		return Quote{Size: size, Side: side, Err: err}
+		return pricing.Quote{Size: size, Side: side, Err: err}
 	}
 	primary, ok := raw[0].(*big.Int)
 	if !ok {
-		return Quote{Size: size, Side: side, Err: fmt.Errorf("unexpected primary output type %T", raw[0])}
+		return pricing.Quote{Size: size, Side: side, Err: fmt.Errorf("unexpected primary output type %T", raw[0])}
 	}
 	price := fromRawAmount(primary, quoteDecimals).Div(size)
-	return Quote{Size: size, Side: side, Price: price}
+	return pricing.Quote{Size: size, Side: side, Price: price}
 }
 
 // call packs the given method's params, fires an eth_call to QuoterV2 at

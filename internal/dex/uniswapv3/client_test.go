@@ -13,6 +13,8 @@ import (
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/shopspring/decimal"
+
+	"github.com/FrancoLiberali/terrace-challenge/internal/pricing"
 )
 
 // newQuoterServer stands up a fake JSON-RPC server that recognizes
@@ -141,13 +143,13 @@ func TestEffectivePrices_HappyPath(t *testing.T) {
 	}
 
 	checks := []struct {
-		q         Quote
-		wantSide  Side
+		q         pricing.Quote
+		wantSide  pricing.Side
 		wantPrice string
 		comment   string
 	}{
-		{quotes.Sell[0], Sell, "1700", "1 ETH SELL"},
-		{quotes.Buy[0], Buy, "1710", "1 ETH BUY"},
+		{quotes.Sell[0], pricing.Sell, "1700", "1 ETH SELL"},
+		{quotes.Buy[0], pricing.Buy, "1710", "1 ETH BUY"},
 	}
 	for _, c := range checks {
 		if c.q.Err != nil {
@@ -210,6 +212,29 @@ func TestEffectivePrices_MultipleSizes_IssuesOneCallPerSizePerSide(t *testing.T)
 	}
 	if !quotes.Sell[2].Price.Equal(dec("17")) {
 		t.Errorf("Sell[2] (size 100): got %s, want 17", quotes.Sell[2].Price)
+	}
+}
+
+func TestEffectivePrices_EmptySizes(t *testing.T) {
+	// No eth_calls should fire and both returned slices should be empty
+	// (not nil-failure-prone).
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		t.Error("server should not be hit when sizes is empty")
+	}))
+	defer srv.Close()
+
+	client, err := NewClient(srv.URL)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer client.Close()
+
+	quotes, err := client.EffectivePrices(context.Background(), PoolETHUSDC03, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(quotes.Buy) != 0 || len(quotes.Sell) != 0 {
+		t.Errorf("empty input: got Buy=%d Sell=%d, want 0/0", len(quotes.Buy), len(quotes.Sell))
 	}
 }
 

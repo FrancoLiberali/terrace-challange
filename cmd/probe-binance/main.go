@@ -15,6 +15,7 @@ import (
 	"github.com/shopspring/decimal"
 
 	"github.com/FrancoLiberali/terrace-challenge/internal/cex/binance"
+	"github.com/FrancoLiberali/terrace-challenge/internal/pricing"
 )
 
 const requestTimeout = 10 * time.Second
@@ -47,7 +48,7 @@ func run() error {
 // printQuotes renders the per-size effective prices. Buy[i] and Sell[i]
 // correspond to sizes[i]. The smallest configured size effectively reads
 // the top of the book.
-func printQuotes(w io.Writer, sizes []decimal.Decimal, quotes binance.Quotes) {
+func printQuotes(w io.Writer, sizes []decimal.Decimal, quotes pricing.Quotes) {
 	fmt.Fprintln(w, "Binance ETH-USDC effective prices (slippage-aware):")
 	fmt.Fprintf(w, "  %-14s   %-22s   %-22s\n", "Size", "BUY (eat asks)", "SELL (eat bids)")
 	for i, sz := range sizes {
@@ -59,7 +60,7 @@ func printQuotes(w io.Writer, sizes []decimal.Decimal, quotes binance.Quotes) {
 	}
 }
 
-func formatQuote(q binance.Quote) string {
+func formatQuote(q pricing.Quote) string {
 	if q.Err != nil {
 		return "insufficient depth"
 	}
