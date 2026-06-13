@@ -1,8 +1,9 @@
 // Package chain subscribes to Ethereum's newHeads stream over WebSocket
 // and emits one BlockEvent per new block. It owns the connection
-// lifecycle: dial, subscribe, reconnect after drops, last-block tracking
-// for gap detection on reconnect, and clean shutdown on context
-// cancellation.
+// lifecycle: dial, subscribe, reconnect after drops, and clean shutdown
+// on context cancellation. Consumers that care about missed blocks
+// across a reconnect can compute that from BlockEvent.Number themselves
+// — the subscriber does not interpret the stream.
 //
 // Reconnects use a small constant delay between attempts — just enough to
 // avoid hammering the node during a sustained outage. The proper
@@ -19,7 +20,6 @@ import (
 	"fmt"
 	"log"
 	"math/big"
-	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum"
@@ -56,17 +56,13 @@ type subscription interface {
 // one BlockEvent per new block on the channel returned by Events().
 //
 // Connection drops are handled internally: the subscriber redials after
-// a constant delay (reconnectDelay) and resumes the subscription. A
-// gap-detection log line fires when the first block after a reconnect
-// skips one or more numbers past the last seen block — missed headers
-// are not backfilled; that decision belongs to the consumer.
+// a constant delay (reconnectDelay) and resumes the subscription on the
+// next available block. Missed blocks during the outage are not
+// backfilled and not flagged — consumers that care can detect gaps from
+// the BlockEvent.Number sequence directly.
 type Subscriber struct {
 	dial dialer
 	out  chan BlockEvent
-
-	// lastBlock tracks the most recent block number seen, used to log
-	// gap warnings when a fresh subscription resumes past it.
-	lastBlock atomic.Uint64
 
 	// reconnectDelay is the wait between reconnect attempts. NewSubscriber
 	// sets a sane default; tests in this package override it directly to
@@ -97,18 +93,33 @@ func (s *Subscriber) Events() <-chan BlockEvent { return s.out }
 // across reconnects. It closes the Events channel before returning so
 // consumers ranging over it terminate naturally.
 func (s *Subscriber) Run(ctx context.Context) error {
+	// Closing s.out on the way out is what makes the consumer's
+	// `for ev := range sub.Events()` loop terminate. Deferring it
+	// guarantees we close on every return path (ctx cancel during
+	// dial, ctx cancel during sleep, ctx cancel during stream).
 	defer close(s.out)
 
 	for {
+		// Check ctx before every dial. Skipping this would let a
+		// cancellation that races with the previous iteration's
+		// teardown still result in one more dial — wasteful, and
+		// briefly holds open a connection we're about to close.
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		sub, err := s.dial.Dial(ctx)
 		if err != nil {
+			// A ctx-related error from Dial is the consumer telling
+			// us to stop, not a connection failure. Propagate it
+			// directly: no log line (the consumer knows they
+			// cancelled), no sleep (we're not retrying).
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return err
 			}
 			s.logger.Printf("chain: dial failed: %v; retrying in %v", err, s.reconnectDelay)
+			// sleepCtx returns false if ctx fires before the delay
+			// elapses, meaning the consumer cancelled mid-backoff —
+			// bow out with the ctx error rather than redialing.
 			if !sleepCtx(ctx, s.reconnectDelay) {
 				return ctx.Err()
 			}
@@ -116,13 +127,25 @@ func (s *Subscriber) Run(ctx context.Context) error {
 		}
 
 		err = s.stream(ctx, sub)
+		// Tear down the WS connection on every exit from stream(),
+		// whether stream returned because of ctx cancel or because
+		// the subscription died. Missing this would leak the WS
+		// socket and go-ethereum's reader goroutine on every reconnect.
 		sub.Close()
+		// stream returns nil on ctx cancel and non-nil on subscription
+		// death — but we can't trust nil-as-cancel alone, since stream
+		// can also return nil if the consumer left mid-emit. Re-check
+		// ctx directly: if it fired, the consumer wants out, not another
+		// reconnect.
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		// Subscription dropped while ctx is still alive. Loop back to
-		// redial; no delay here — the drop itself is the timing signal,
-		// and the next dial may well succeed immediately.
+		// Subscription dropped while ctx is still alive — provider hiccup,
+		// TCP reset, peer-initiated close. Loop back to redial without
+		// delay: the drop itself is the timing signal (the node was alive
+		// enough to send us an error, so the network just changed state),
+		// and the next dial often succeeds immediately. The
+		// reconnectDelay only applies to *dial-failure* retries above.
 		s.logger.Printf("chain: subscription dropped: %v; reconnecting", err)
 	}
 }
@@ -134,21 +157,31 @@ func (s *Subscriber) stream(ctx context.Context, sub subscription) error {
 	for {
 		select {
 		case <-ctx.Done():
+			// Graceful exit. Return nil so Run() distinguishes
+			// "consumer cancelled" from "subscription died" (which
+			// comes through the sub.Err() arm below). The nil result
+			// is correct because cancellation isn't an error
+			// condition — it's the requested behavior.
 			return nil
 		case err := <-sub.Err():
+			// go-ethereum's Subscription.Err() contract allows nil
+			// to mean "subscription closed without an error reason"
+			// (e.g., the server initiated a clean unsubscribe).
+			// We synthesize an error so Run()'s log line and any
+			// upstream error-handling have something non-nil to
+			// describe the reason for the reconnect.
 			if err == nil {
 				return errors.New("subscription closed without error")
 			}
 			return err
 		case h := <-sub.Headers():
+			// A nil header on a successful receive means the channel
+			// was closed under us — go-ethereum no longer has anything
+			// to send. Treat this the same as a dropped subscription
+			// so Run() redials.
 			if h == nil {
 				return errors.New("subscription channel closed")
 			}
-			n := h.Number.Uint64()
-			if last := s.lastBlock.Load(); last != 0 && n > last+1 {
-				s.logger.Printf("chain: potential gap: missed blocks %d..%d", last+1, n-1)
-			}
-			s.lastBlock.Store(n)
 			// h.Time is uint64 (Ethereum stores block timestamps as
 			// seconds-since-epoch in an unsigned integer because the chain
 			// has no concept of "before genesis"). time.Unix takes int64
@@ -162,10 +195,16 @@ func (s *Subscriber) stream(ctx context.Context, sub subscription) error {
 			// cannot occur on any plausible chain, so we suppress the
 			// warning rather than adding inert runtime bounds-checking.
 			ev := BlockEvent{
-				Number:    n,
+				Number:    h.Number.Uint64(),
 				Timestamp: time.Unix(int64(h.Time), 0).UTC(), //nolint:gosec // see comment above
 				BaseFee:   h.BaseFee,
 			}
+			// Nested select on emit. s.out is unbuffered (backpressure
+			// is intentional — we want consumer stalls to be visible),
+			// so a naked `s.out <- ev` would block forever if the
+			// consumer goroutine already exited. The ctx-Done arm is
+			// the escape hatch — without it, Run() would hang on
+			// shutdown if the consumer left mid-emit.
 			select {
 			case s.out <- ev:
 			case <-ctx.Done():
@@ -177,6 +216,23 @@ func (s *Subscriber) stream(ctx context.Context, sub subscription) error {
 
 // sleepCtx sleeps for d or until ctx is cancelled; returns true if the
 // full duration elapsed, false if ctx fired first.
+//
+// Why NewTimer + defer Stop instead of `<-time.After(d)`: time.After parks
+// a Timer in the runtime that doesn't get released until the timer
+// actually fires. If ctx.Done() wins the select, the underlying timer
+// keeps running pointlessly until d elapses — small leak, but it adds up
+// across many reconnect cycles. NewTimer with `defer Stop()` releases
+// the timer the moment we exit the function. (Go 1.23 made time.After
+// smarter about this; NewTimer is the portable form.)
+//
+// Why bool return rather than error: the only "error" path here is ctx
+// cancellation, which the caller can read directly from ctx.Err(). A
+// bool keeps the call site one-liner-clean:
+//
+//	if !sleepCtx(ctx, d) { return ctx.Err() }
+//
+// — and makes the intent ("did we sleep the whole way?") explicit at
+// the call site instead of buried in an error type.
 func sleepCtx(ctx context.Context, d time.Duration) bool {
 	t := time.NewTimer(d)
 	defer t.Stop()
@@ -197,9 +253,18 @@ func (e *ethDialer) Dial(ctx context.Context) (subscription, error) {
 	if err != nil {
 		return nil, fmt.Errorf("dial RPC: %w", err)
 	}
-	ch := make(chan *types.Header, 16) //nolint:mnd // small buffer; one slot per block, 16 ≈ 3 minutes of mainnet headroom
+	// Buffered between go-ethereum's WS reader goroutine and our stream()
+	// loop. Unbuffered would mean any transient consumer pause stalls the
+	// wire reader → TCP backpressure → eventual forced reconnect. 16 slots
+	// at ~12s/block is ~3 minutes of headroom — enough for GC pauses and
+	// downstream hiccups, small enough not to hoard stale blocks.
+	ch := make(chan *types.Header, 16) //nolint:mnd // see comment above
 	sub, err := client.SubscribeNewHead(ctx, ch)
 	if err != nil {
+		// SubscribeNewHead failed AFTER the WS connection was opened.
+		// We have to close the client manually here, otherwise we leak
+		// both the TCP socket and the reader goroutine ethclient already
+		// started internally.
 		client.Close()
 		return nil, fmt.Errorf("subscribe newHeads: %w", err)
 	}
@@ -216,6 +281,12 @@ type ethSubscription struct {
 
 func (e *ethSubscription) Headers() <-chan *types.Header { return e.headers }
 func (e *ethSubscription) Err() <-chan error             { return e.sub.Err() }
+
+// Close tears down both layers of the subscription. Both calls are
+// necessary: Unsubscribe stops go-ethereum's per-subscription reader
+// goroutine, and client.Close releases the underlying WS connection.
+// Missing Unsubscribe orphans the reader; missing client.Close leaks
+// the TCP socket.
 func (e *ethSubscription) Close() {
 	e.sub.Unsubscribe()
 	e.client.Close()

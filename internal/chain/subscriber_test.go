@@ -177,35 +177,6 @@ func TestSubscriber_ReconnectsAfterDrop(t *testing.T) {
 	<-done
 }
 
-func TestSubscriber_LogsGapAfterReconnect(t *testing.T) {
-	first := newFakeSubscription()
-	first.headers <- header(300, 1_700_000_000, 1)
-
-	second := newFakeSubscription()
-	// Five blocks went by while we were disconnected (301..305 missing).
-	second.headers <- header(306, 1_700_000_060, 2)
-
-	d := &fakeDialer{plan: []dialStep{{sub: first}, {sub: second}}}
-	var logBuf bytes.Buffer
-	s := newTestSubscriber(d, &logBuf)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan error, 1)
-	go func() { done <- s.Run(ctx) }()
-
-	<-s.Events() // block 300
-	first.errs <- errors.New("dropped")
-	<-s.Events() // block 306
-
-	if !strings.Contains(logBuf.String(), "missed blocks 301..305") {
-		t.Errorf("expected gap log mentioning 301..305, got: %q", logBuf.String())
-	}
-
-	cancel()
-	<-done
-}
-
 func TestSubscriber_RetriesAfterDialFailures(t *testing.T) {
 	good := newFakeSubscription()
 	good.headers <- header(400, 1_700_000_000, 1)
