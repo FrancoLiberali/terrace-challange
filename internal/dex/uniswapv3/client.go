@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"sync"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
@@ -63,10 +64,16 @@ func (c *Client) EffectivePrices(ctx context.Context, pool Pool, sizes []decimal
 		Buy:  make([]pricing.Quote, len(sizes)),
 		Sell: make([]pricing.Quote, len(sizes)),
 	}
+	// Each call is independent and each goroutine writes to a unique slice
+	// slot, so no synchronization is needed beyond the WaitGroup. HTTP/2
+	// multiplexes the 2N concurrent eth_calls over a single TCP connection
+	// to the RPC endpoint.
+	var wg sync.WaitGroup
 	for i, size := range sizes {
-		out.Buy[i] = c.quoteBuy(ctx, pool, size)
-		out.Sell[i] = c.quoteSell(ctx, pool, size)
+		wg.Go(func() { out.Buy[i] = c.quoteBuy(ctx, pool, size) })
+		wg.Go(func() { out.Sell[i] = c.quoteSell(ctx, pool, size) })
 	}
+	wg.Wait()
 	return out, nil
 }
 

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
@@ -30,6 +31,11 @@ func newQuoterServer(t *testing.T, sellOut, buyOut []byte, selectorCounts map[st
 	}
 	sellID := parsed.Methods["quoteExactInputSingle"].ID
 	buyID := parsed.Methods["quoteExactOutputSingle"].ID
+
+	// EffectivePrices issues its eth_calls in parallel, so multiple handler
+	// goroutines race on selectorCounts. A single mutex serializes the
+	// increments without changing the helper's external API.
+	var mu sync.Mutex
 
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
@@ -67,12 +73,16 @@ func newQuoterServer(t *testing.T, sellOut, buyOut []byte, selectorCounts map[st
 		switch {
 		case bytes.Equal(callData[:4], sellID):
 			if selectorCounts != nil {
+				mu.Lock()
 				selectorCounts["sell"]++
+				mu.Unlock()
 			}
 			out = sellOut
 		case bytes.Equal(callData[:4], buyID):
 			if selectorCounts != nil {
+				mu.Lock()
 				selectorCounts["buy"]++
+				mu.Unlock()
 			}
 			out = buyOut
 		default:
