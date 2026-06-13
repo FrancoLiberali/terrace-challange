@@ -100,30 +100,9 @@ func (s *Subscriber) Run(ctx context.Context) error {
 	defer close(s.out)
 
 	for {
-		// Check ctx before every dial. Skipping this would let a
-		// cancellation that races with the previous iteration's
-		// teardown still result in one more dial — wasteful, and
-		// briefly holds open a connection we're about to close.
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		sub, err := s.dial.Dial(ctx)
+		sub, err := s.dialWithRetry(ctx)
 		if err != nil {
-			// A ctx-related error from Dial is the consumer telling
-			// us to stop, not a connection failure. Propagate it
-			// directly: no log line (the consumer knows they
-			// cancelled), no sleep (we're not retrying).
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return err
-			}
-			s.logger.Printf("chain: dial failed: %v; retrying in %v", err, s.reconnectDelay)
-			// sleepCtx returns false if ctx fires before the delay
-			// elapses, meaning the consumer cancelled mid-backoff —
-			// bow out with the ctx error rather than redialing.
-			if !sleepCtx(ctx, s.reconnectDelay) {
-				return ctx.Err()
-			}
-			continue
+			return err
 		}
 
 		err = s.stream(ctx, sub)
@@ -145,8 +124,39 @@ func (s *Subscriber) Run(ctx context.Context) error {
 		// delay: the drop itself is the timing signal (the node was alive
 		// enough to send us an error, so the network just changed state),
 		// and the next dial often succeeds immediately. The
-		// reconnectDelay only applies to *dial-failure* retries above.
+		// reconnectDelay only applies to *dial-failure* retries inside
+		// dialWithRetry.
 		s.logger.Printf("chain: subscription dropped: %v; reconnecting", err)
+	}
+}
+
+// dialWithRetry returns a live subscription, retrying after reconnectDelay
+// on any non-ctx error. The retry loop is self-contained so Run() reads
+// as a clean three-step state machine (dial → stream → reconnect).
+//
+// Returns (sub, nil) on success. Returns (nil, err) only when ctx is
+// cancelled or its deadline expires — at which point Run() propagates
+// the error up to the caller and shuts down.
+func (s *Subscriber) dialWithRetry(ctx context.Context) (subscription, error) {
+	for {
+		sub, err := s.dial.Dial(ctx)
+		if err == nil {
+			return sub, nil
+		}
+		// A ctx-related error from Dial is the consumer telling us to
+		// stop, not a connection failure. Propagate it directly: no log
+		// line (the consumer knows they cancelled), no sleep (we're not
+		// retrying).
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
+		}
+		s.logger.Printf("chain: dial failed: %v; retrying in %v", err, s.reconnectDelay)
+		// sleepCtx returns false if ctx fires before the delay elapses,
+		// meaning the consumer cancelled mid-backoff — bow out with the
+		// ctx error rather than redialing.
+		if !sleepCtx(ctx, s.reconnectDelay) {
+			return nil, ctx.Err()
+		}
 	}
 }
 
@@ -199,18 +209,29 @@ func (s *Subscriber) stream(ctx context.Context, sub subscription) error {
 				Timestamp: time.Unix(int64(h.Time), 0).UTC(), //nolint:gosec // see comment above
 				BaseFee:   h.BaseFee,
 			}
-			// Nested select on emit. s.out is unbuffered (backpressure
-			// is intentional — we want consumer stalls to be visible),
-			// so a naked `s.out <- ev` would block forever if the
-			// consumer goroutine already exited. The ctx-Done arm is
-			// the escape hatch — without it, Run() would hang on
-			// shutdown if the consumer left mid-emit.
-			select {
-			case s.out <- ev:
-			case <-ctx.Done():
+			if !s.emit(ctx, ev) {
 				return nil
 			}
 		}
+	}
+}
+
+// emit sends ev to the consumer on s.out. Returns true on success, false
+// if ctx fired while we were waiting for a reader — in which case the
+// caller should stop streaming and let Run() exit cleanly.
+//
+// Why a select rather than a naked `s.out <- ev`: s.out is unbuffered
+// (backpressure is intentional — we want consumer stalls to be visible),
+// so a naked send would block forever if the consumer goroutine already
+// exited. Without the ctx-Done arm, Run() could hang on shutdown if the
+// consumer left mid-emit. The cost is one possibly-lost BlockEvent on
+// shutdown, which is fine — we're shutting down anyway.
+func (s *Subscriber) emit(ctx context.Context, ev BlockEvent) bool {
+	select {
+	case s.out <- ev:
+		return true
+	case <-ctx.Done():
+		return false
 	}
 }
 
