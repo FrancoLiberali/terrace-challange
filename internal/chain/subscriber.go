@@ -28,8 +28,6 @@ import (
 )
 
 // BlockEvent is one block observation produced by the subscriber.
-//
-// BlockEvent is one block observation produced by the subscriber.
 type BlockEvent struct {
 	Number    uint64
 	Timestamp time.Time
