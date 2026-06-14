@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/joho/godotenv"
 	"github.com/shopspring/decimal"
@@ -27,6 +28,15 @@ import (
 	"github.com/FrancoLiberali/terrace-challenge/internal/dex/uniswapv3"
 	"github.com/FrancoLiberali/terrace-challenge/internal/pathfinder"
 	"github.com/FrancoLiberali/terrace-challenge/internal/pipeline"
+	"github.com/FrancoLiberali/terrace-challenge/internal/resilience"
+)
+
+// Venue identifiers used across map keys, log fields, breaker labels,
+// and the "venues" list — the canonical names the rest of the bot
+// refers to each integration by.
+const (
+	venueBinance = "binance"
+	venueUniswap = "uniswap"
 )
 
 // Hardcoded for now; configuration lands in Step 7.
@@ -110,19 +120,32 @@ func run() error {
 	// consumes candidates and applies the cost model inline.
 	sub := chain.NewSubscriber(cfg.wsURL)
 
-	binanceClient := binance.NewClient(binance.DefaultBaseURL)
-	binanceSn := pipeline.NewBinanceSnapshotter(binanceClient, binance.SymbolETHUSDC, tradeSizes)
+	breakerStateLog := func(venue string, from, to string) {
+		slog.Warn("circuit breaker state change", "venue", venue, "from", from, "to", to)
+	}
 
-	uniswapClient, err := uniswapv3.NewClient(cfg.httpURL)
+	binanceHTTP := resilience.NewRetryingHTTPClient(resilience.DefaultRetryConfig(), 10*time.Second, slog.Default())
+	binanceClient := binance.NewClientWithHTTP(binance.DefaultBaseURL, binanceHTTP)
+	var binanceSn pipeline.Snapshotter = pipeline.NewBinanceSnapshotter(binanceClient, binance.SymbolETHUSDC, tradeSizes)
+	binanceSn = pipeline.CircuitBroken(binanceSn, resilience.NewCircuitBreaker(resilience.BreakerConfig{
+		Name: venueBinance, ConsecutiveFails: 5, Cooldown: 30 * time.Second, OnStateChange: breakerStateLog,
+	}))
+	binanceSn = pipeline.RateLimited(binanceSn, resilience.NewRateLimiter(5, 2))
+
+	uniswapClient, err := uniswapv3.NewClientWithRetry(cfg.httpURL, resilience.DefaultRetryConfig())
 	if err != nil {
 		return fmt.Errorf("connect to RPC: %w", err)
 	}
 	defer uniswapClient.Close()
-	uniswapSn := pipeline.NewUniswapSnapshotter(uniswapClient, uniswapv3.PoolETHUSDC03, tradeSizes)
+	var uniswapSn pipeline.Snapshotter = pipeline.NewUniswapSnapshotter(uniswapClient, uniswapv3.PoolETHUSDC03, tradeSizes)
+	uniswapSn = pipeline.CircuitBroken(uniswapSn, resilience.NewCircuitBreaker(resilience.BreakerConfig{
+		Name: venueUniswap, ConsecutiveFails: 5, Cooldown: 30 * time.Second, OnStateChange: breakerStateLog,
+	}))
+	uniswapSn = pipeline.RateLimited(uniswapSn, resilience.NewRateLimiter(10, 10))
 
 	disp := pipeline.NewDispatcher(map[string]pipeline.Snapshotter{
-		"binance": binanceSn,
-		"uniswap": uniswapSn,
+		venueBinance: binanceSn,
+		venueUniswap: uniswapSn,
 	})
 	pf := pathfinder.NewPathfinder()
 	ev := arbitrage.NewEvaluator(defaultCostModel)
@@ -135,7 +158,7 @@ func run() error {
 	go func() { pfErr <- pf.Run(ctx, disp.Results()) }()
 
 	slog.Info("arbd starting",
-		"venues", []string{"binance", "uniswap"},
+		"venues", []string{venueBinance, venueUniswap},
 		"pair", "ETH-USDC",
 		"dex_pool", "uniswap_v3_0.3pct",
 		"threshold_usdc", defaultCostModel.MinNetProfitUSDC.String(),
