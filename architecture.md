@@ -235,7 +235,7 @@ The Coordinator reads BlockEvents, fans out to each adapter, `wg.Wait()`s for al
 **Pros**:
 
 - **Freshness is trivially enforced**: per-block context cancellation IS the supersession mechanism. No downstream filter needed.
-- **~50 fewer LOC** for the pipeline package; no correlation logic anywhere downstream.
+- **~50 fewer lines of code** for the pipeline package; no correlation logic anywhere downstream.
 - **Matches the challenge's "simpler architecture" valuation** for block-driven explicitly.
 
 **Cons**:
