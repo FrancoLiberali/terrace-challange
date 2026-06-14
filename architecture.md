@@ -13,7 +13,7 @@ The architecture is deliberately a **single Go process** with no message broker 
 - [Data flow](#data-flow)
 - [Design decisions](#design-decisions)
   - [1. The Block Subscriber is the only producer](#1-the-block-subscriber-is-the-only-producer)
-  - [2. Cancel old block, process new (backpressure)](#2-cancel-old-block-process-new-backpressure)
+  - [2. Block dispatch: streaming over synchronous coordination](#2-block-dispatch-streaming-over-synchronous-coordination)
   - [3. Adapters emit a unified effective-price shape](#3-adapters-emit-a-unified-effective-price-shape)
   - [4. Adapters own multi-size handling internally](#4-adapters-own-multi-size-handling-internally)
   - [5. Path discovery is separate from profitability evaluation](#5-path-discovery-is-separate-from-profitability-evaluation)
@@ -209,18 +209,54 @@ A new block arriving is the only event that drives work. There is no separate po
 
 **Alternative considered**: independent pollers per venue with a join step. Rejected because it complicates the timing semantics and creates a stale-data window between the two venues.
 
-### 2. Cancel old block, process new (backpressure)
+### 2. Block dispatch: streaming over synchronous coordination
 
-If block N's snapshot is still in flight when block N+1's tick arrives, **the in-flight work for block N is cancelled and N+1 is processed instead**. The freshest opportunity is the only one that matters; emitting stale alerts is worse than missing them.
+Two designs were on the table for how per-block work fans out and joins back up. We picked **streaming**; the **synchronous Coordinator with cancel-on-supersession** is the more conservative alternative for a strictly 2-venue block-driven scope, and we document it here because it would have been a defensible choice — and because the trade-off is the natural answer to "how would you extend to multiple DEXes or CEXes?"
 
-Mechanism (conceptual): each snapshot job is scoped to a per-block cancellation signal that the coordinator triggers when a newer block arrives. Anything still in flight (network calls, computations) observes the signal and aborts.
+#### Chosen: streaming Dispatcher (`internal/pipeline`)
 
-**Trade-off**: under sustained slowness (RPC node lag), several consecutive blocks may be skipped. This is surfaced as a structured log warning so the operator can detect degradation.
+The Dispatcher fans block events out to per-venue Snapshotters and forwards their independent results onto a single channel. Each venue has its own per-call timeout; no central wait-for-all. Results arrive when they arrive, and a downstream Pathfinder (Step 5) correlates by block number.
 
-**Alternatives considered**:
+**Pros**:
 
-- *Queue both, process in order*: avoids losing data but creates a snowballing backlog under sustained slowness and serves alerts that no longer represent the current market.
-- *Skip new block if previous is still in flight*: simpler than cancellation but discards the *fresher* observation, which is the opposite of what we want.
+- **Per-venue latency independence**: a slow venue does not delay others. With 2 venues today the gain is marginal, but it scales linearly with venue count.
+- **Structural alignment with the production-scale architecture** described later in this doc. The migration to a broker world becomes "replace channels with broker topics" — the Dispatcher itself disappears because each subscriber consumes from the broker directly.
+- **Simpler concurrency primitives**: no central WaitGroup, no per-block context lifecycle to track, no per-call output coordination. Each goroutine is independent.
+
+**Cons**:
+
+- **Strict freshness ("only the latest block ever surfaces") is not enforced** by the Dispatcher. The publisher of a broker `blocks` topic cannot reach into subscriber processes to cancel in-flight work, so a Dispatcher that mirrors that constraint cannot cancel either. Stale results from block N may appear after block N+1's results have already gone out.
+- The synchronous correctness invariant must be re-implemented downstream if needed (see below).
+
+#### Alternative: synchronous Coordinator with cancel-on-supersession
+
+The Coordinator reads BlockEvents, fans out to each adapter, `wg.Wait()`s for all of them, and emits a single paired `Snapshot{Block, CEX, DEX, CEXErr, DEXErr}`. Each block has its own context; arrival of block N+1 cancels block N's context, aborting in-flight calls.
+
+**Pros**:
+
+- **Freshness is trivially enforced**: per-block context cancellation IS the supersession mechanism. No downstream filter needed.
+- **~50 fewer lines of code** for the pipeline package; no correlation logic anywhere downstream.
+- **Matches the challenge's "simpler architecture" valuation** for block-driven explicitly.
+
+**Cons**:
+
+- **Wait-for-slowest** scales poorly: at N venues, the slowest gates the others. Acceptable at 2; degraded at 5+.
+- **Does not migrate to a broker shape** without restructuring — the whole `wg.Wait` + central-emit pattern is a single-process artifact.
+
+#### Why we picked streaming
+
+Three reasons, in order of weight:
+
+1. **The challenge's "multi-venue extension" discussion point is real.** Choosing streaming means the answer to "how would you scale to N venues?" is "the architecture already does this; here's how." Synchronous-only would force a hypothetical answer.
+2. **Per-venue latency independence is a genuine runtime benefit**, not just a future-proofing argument. As soon as one venue's API degrades (Binance rate limit, Alchemy lag), the streaming design keeps the other venue's results flowing.
+3. **Alignment with the broker section of this document.** The production-scale design described later in this doc replaces the in-process Pipeline with a broker pub/sub. The streaming shape mirrors that data flow; the synchronous Coordinator does not. Keeping them aligned avoids a future "rewrite the dispatch layer when you add a broker."
+
+The cost we accept: freshness is not enforced today. If it becomes important, the natural place is a Pathfinder freshness filter (Step 5) — the Pathfinder already tracks the latest block it has seen, so dropping older results is a one-line addition. A stateful-Snapshotter wrapper (subscriber-side cancellation) is also possible as a decorator, but the Pathfinder filter is the load-bearing fix because race windows let stale results slip past any subscriber-side cancel.
+
+#### Other alternatives considered
+
+- *Queue both, process in order* (no cancellation, no streaming): avoids losing data but creates a snowballing backlog under sustained slowness and serves alerts that no longer represent the current market.
+- *Skip new block if previous is still in flight*: discards the *fresher* observation, the opposite of what we want.
 
 ### 3. Adapters emit a unified effective-price shape
 
