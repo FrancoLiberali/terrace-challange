@@ -148,6 +148,28 @@ The DEX leg's gas units come from QuoterV2's per-call `gasEstimate` output — t
 
 The net effect is that QuoterV2's estimate typically lands within 10–20% of actual mined-block gas usage, biased on the conservative (lower) side. This shares direction with the priority-fee omission described above — both make the cost model under-report gas — but the magnitude is much smaller than the priority-fee gap.
 
+### Gas denomination: converted to USDC via the candidate's `BuyPrice`, not a dedicated reference price
+
+The detector reports gas cost in USDC: `gasUnits × baseFee → wei → ETH → USDC`. The ETH→USDC step uses the candidate's own `BuyPrice` as the reference, which works only because the pair is ETH-USDC and `BuyPrice` happens to be "USDC per ETH" — exactly the number the gas conversion needs.
+
+The shortcut breaks the moment the detector extends to other pairs or chains:
+
+- **Other quote tokens** (e.g. ETH-DAI): `BuyPrice` is "DAI per ETH" — the conversion produces gas cost in DAI, not USDC.
+- **Other base tokens** (e.g. WBTC-USDC): `BuyPrice` is "USDC per WBTC" — the multiplication doesn't yield a meaningful number at all (gas is in ETH, not WBTC).
+- **Other chains** (Polygon, Arbitrum): gas is paid in the chain's native token (MATIC, etc.), not the asset being traded.
+
+Architecturally the gas-cost step inside the evaluator is fusing two responsibilities: **arithmetic** (gas cost in the chain's native gas token) and **denomination** (expressing that cost in the operator's reporting currency). A multi-pair / multi-chain extension would split them — carry gas in its native unit through the evaluator and convert to the reporting currency at the alert boundary, using a gas-token reference price sourced independently of any one trade pair.
+
+For the single-pair, single-chain scope here, the conflation is harmless: `BuyPrice` happens to be the right ETH/USDC reference. The limitation is shape, not correctness.
+
+### Pre-funded gas reserve: assumed available, not modelled
+
+Gas on Ethereum is paid in ETH out of the executing account's balance at the moment of submission, before any swap output arrives. The operator must hold an ETH reserve in that account — separate from the USDC trading capital — large enough to cover gas for every transaction they intend to submit. The detector assumes this reserve is present and unbounded: per-trade gas is subtracted from the spread for profitability purposes, but the operational prerequisite of *having ETH on hand to pay it* is not modelled.
+
+For a single arb the reserve is trivial (sub-cent at current base fees). Over a long-running session at scale it is non-trivial: the reserve depletes with every transaction, must be topped up from profits, and a depleted reserve halts DEX-side execution silently.
+
+A production trading version would either maintain an explicit gas float — monitored separately from trading capital, gated by a low-water alert — or submit DEX legs as Flashbots bundles that pay the builder bribe atomically out of the arb's own swap proceeds, dissolving the prerequisite in steady state. The bundle path requires the private-mempool stack already noted in §4.
+
 ---
 
 ## 8. Trading fees use a hardcoded schedule, not the operator's live per-account rate
