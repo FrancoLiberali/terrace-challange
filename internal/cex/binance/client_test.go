@@ -6,11 +6,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/shopspring/decimal"
 
 	"github.com/FrancoLiberali/terrace-challenge/internal/pricing"
+	"github.com/FrancoLiberali/terrace-challenge/internal/resilience"
 )
 
 func TestClient_EffectivePrices(t *testing.T) {
@@ -166,6 +169,47 @@ func TestClient_EffectivePrices_NonOKStatus(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "400") {
 		t.Errorf("error should mention status 400, got: %v", err)
+	}
+}
+
+func TestClient_NewClientWithHTTP_RetriesTransient5xx(t *testing.T) {
+	// Server fails twice with 503 then returns valid depth JSON. Wired
+	// with a binance.Client that uses resilience.NewRetryingHTTPClient,
+	// EffectivePrices should succeed (proving the injected retrying
+	// transport actually retried the failed attempts).
+	const body = `{
+		"lastUpdateId": 1,
+		"bids": [["2249.50", "8.2"]],
+		"asks": [["2250.10", "3.5"]]
+	}`
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) < 3 {
+			http.Error(w, "boom", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	cfg := resilience.RetryConfig{
+		MaxRetries:  3,
+		InitialWait: 5 * time.Millisecond,
+		MaxWait:     20 * time.Millisecond,
+	}
+	httpClient := resilience.NewRetryingHTTPClient(cfg, 2*time.Second, nil)
+	client := NewClientWithHTTP(srv.URL, httpClient)
+
+	quotes, err := client.EffectivePrices(context.Background(), SymbolETHUSDC, []decimal.Decimal{dec("1")})
+	if err != nil {
+		t.Fatalf("EffectivePrices: %v", err)
+	}
+	if len(quotes.Buy) != 1 {
+		t.Fatalf("expected 1 quote, got %d", len(quotes.Buy))
+	}
+	if got := calls.Load(); got != 3 {
+		t.Errorf("expected 3 server hits (2 retries + success), got %d", got)
 	}
 }
 

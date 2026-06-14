@@ -10,12 +10,15 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/shopspring/decimal"
 
 	"github.com/FrancoLiberali/terrace-challenge/internal/pricing"
+	"github.com/FrancoLiberali/terrace-challenge/internal/resilience"
 )
 
 // newQuoterServer stands up a fake JSON-RPC server that recognizes
@@ -291,3 +294,168 @@ func TestEffectivePrices_PerRowFailureWhenRPCErrors(t *testing.T) {
 		t.Errorf("expected Buy[0].Err to be set, got nil")
 	}
 }
+
+func TestEffectivePrices_RetriesTransientJSONRPCErrors(t *testing.T) {
+	// Fails the first 2 hits with a transient JSON-RPC server error
+	// (code -32603 internal error), then behaves like a normal quoter
+	// server. With retries enabled both Buy and Sell legs should
+	// eventually succeed; the server must see strictly more hits than
+	// the 2 a non-retrying client would generate.
+	sellOut := packOutputs(t, "quoteExactInputSingle", big.NewInt(1_700_000_000), 0)
+	buyOut := packOutputs(t, "quoteExactOutputSingle", big.NewInt(1_710_000_000), 0)
+
+	parsed, err := abi.JSON(strings.NewReader(quoterV2ABI))
+	if err != nil {
+		t.Fatalf("parse ABI: %v", err)
+	}
+	sellID := parsed.Methods["quoteExactInputSingle"].ID
+	buyID := parsed.Methods["quoteExactOutputSingle"].ID
+
+	var hits atomic.Int32
+	const initialFails = 2
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID     json.RawMessage   `json:"id"`
+			Params []json.RawMessage `json:"params"`
+		}
+		if decodeErr := json.NewDecoder(r.Body).Decode(&req); decodeErr != nil {
+			t.Errorf("decode request: %v", decodeErr)
+			return
+		}
+		if hits.Add(1) <= initialFails {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      req.ID,
+				"error":   map[string]any{"code": -32603, "message": "internal server error"},
+			})
+			return
+		}
+		// Decode the call data and dispatch like the normal quoter server.
+		var msg struct {
+			Input string `json:"input"`
+			Data  string `json:"data"`
+		}
+		_ = json.Unmarshal(req.Params[0], &msg)
+		hexData := msg.Input
+		if hexData == "" {
+			hexData = msg.Data
+		}
+		callData, _ := hex.DecodeString(strings.TrimPrefix(hexData, "0x"))
+		var out []byte
+		switch {
+		case bytes.Equal(callData[:4], sellID):
+			out = sellOut
+		case bytes.Equal(callData[:4], buyID):
+			out = buyOut
+		default:
+			t.Errorf("unknown selector 0x%x", callData[:4])
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      req.ID,
+			"result":  "0x" + hex.EncodeToString(out),
+		})
+	}))
+	defer srv.Close()
+
+	cfg := resilience.RetryConfig{
+		MaxRetries:  3,
+		InitialWait: 5 * time.Millisecond,
+		MaxWait:     20 * time.Millisecond,
+	}
+	client, err := NewClientWithRetry(srv.URL, cfg)
+	if err != nil {
+		t.Fatalf("NewClientWithRetry: %v", err)
+	}
+	defer client.Close()
+
+	quotes, err := client.EffectivePrices(t.Context(), PoolETHUSDC03, []decimal.Decimal{dec("1")})
+	if err != nil {
+		t.Fatalf("EffectivePrices: %v", err)
+	}
+	if quotes.Buy[0].Err != nil {
+		t.Errorf("expected clean Buy quote after retry, got Err=%v", quotes.Buy[0].Err)
+	}
+	if quotes.Sell[0].Err != nil {
+		t.Errorf("expected clean Sell quote after retry, got Err=%v", quotes.Sell[0].Err)
+	}
+	if got := hits.Load(); got <= 2 {
+		t.Errorf("server should have been hit more than 2 times after retries, got %d", got)
+	}
+}
+
+func TestEffectivePrices_DoesNotRetryExecutionReverted(t *testing.T) {
+	// Execution reverted is deterministic: retrying produces the same
+	// error. The retry-aware client must classify it as Permanent and
+	// surface the failure after exactly one attempt per row. With 1
+	// size = 2 calls (Buy + Sell), server must be hit exactly twice.
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		var req struct {
+			ID json.RawMessage `json:"id"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      req.ID,
+			"error":   map[string]any{"code": -32000, "message": "execution reverted"},
+		})
+	}))
+	defer srv.Close()
+
+	cfg := resilience.RetryConfig{
+		MaxRetries:  3,
+		InitialWait: 5 * time.Millisecond,
+		MaxWait:     20 * time.Millisecond,
+	}
+	client, err := NewClientWithRetry(srv.URL, cfg)
+	if err != nil {
+		t.Fatalf("NewClientWithRetry: %v", err)
+	}
+	defer client.Close()
+
+	quotes, err := client.EffectivePrices(t.Context(), PoolETHUSDC03, []decimal.Decimal{dec("1")})
+	if err != nil {
+		t.Fatalf("top-level error: %v", err)
+	}
+	if got := hits.Load(); got != 2 {
+		t.Errorf("expected exactly 2 server hits (no retries on reverted), got %d", got)
+	}
+	if quotes.Buy[0].Err == nil || !strings.Contains(quotes.Buy[0].Err.Error(), "execution reverted") {
+		t.Errorf("expected execution-reverted on Buy, got %v", quotes.Buy[0].Err)
+	}
+	if quotes.Sell[0].Err == nil || !strings.Contains(quotes.Sell[0].Err.Error(), "execution reverted") {
+		t.Errorf("expected execution-reverted on Sell, got %v", quotes.Sell[0].Err)
+	}
+}
+
+func TestIsDeterministicCallErr(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"execution reverted", errString("execution reverted"), true},
+		{"execution reverted with detail", errString("execution reverted: SPL"), true},
+		{"invalid opcode", errString("invalid opcode: 0xfe"), true},
+		{"out of gas", errString("out of gas"), true},
+		{"insufficient funds", errString("insufficient funds for gas"), true},
+		{"network timeout", errString("context deadline exceeded"), false},
+		{"connection refused", errString("dial tcp: connect: connection refused"), false},
+		{"json-rpc internal", errString("json-rpc internal error"), false},
+	}
+	for _, c := range cases {
+		if got := isDeterministicCallErr(c.err); got != c.want {
+			t.Errorf("%s: got %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// errString is a tiny errors.New shorthand for the classifier-table test.
+func errString(s string) error { return &stringError{s} }
+
+type stringError struct{ s string }
+
+func (e *stringError) Error() string { return e.s }

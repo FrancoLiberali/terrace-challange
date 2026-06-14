@@ -57,13 +57,21 @@ type Client struct {
 	httpClient *http.Client
 }
 
-// NewClient constructs a Client bound to the given base URL. The HTTP client
-// has a backstop timeout; callers should still pass a context with a deadline.
+// NewClient constructs a Client bound to the given base URL with a
+// vanilla http.Client (backstop timeout, no retries). Suitable for
+// tests and the probe binary; arbd uses NewClientWithHTTP to inject a
+// retrying transport.
 func NewClient(baseURL string) *Client {
-	return &Client{
-		baseURL:    baseURL,
-		httpClient: &http.Client{Timeout: defaultHTTPTimeout},
-	}
+	return NewClientWithHTTP(baseURL, &http.Client{Timeout: defaultHTTPTimeout})
+}
+
+// NewClientWithHTTP constructs a Client bound to the given base URL
+// using the supplied http.Client. This is the seam for injecting a
+// retrying transport (see internal/resilience.NewRetryingHTTPClient)
+// or any other transport-level concern that needs to wrap every HTTP
+// request the adapter issues.
+func NewClientWithHTTP(baseURL string, httpClient *http.Client) *Client {
+	return &Client{baseURL: baseURL, httpClient: httpClient}
 }
 
 // EffectivePrices returns the slippage-aware, fee-adjusted effective
