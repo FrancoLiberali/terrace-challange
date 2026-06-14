@@ -139,14 +139,28 @@ func (p *Pathfinder) handle(ctx context.Context, r pipeline.VenueResult) {
 // emitPairs enumerates both arbitrage directions at every size shared
 // between the two venues, emitting a CandidatePath per (size, direction)
 // where both legs have clean quotes.
+//
+// Within a single venue, the adapter writes Buy[i] and Sell[i] from the
+// same input size, so Buy[i].Size == Sell[i].Size by construction.
+// Across venues that alignment is a system invariant — both
+// snapshotters are configured with the same size set at startup — not
+// a contract on pricing.Quotes itself, so we verify it explicitly:
+// length mismatch skips the entire pair, per-index size mismatch skips
+// that index. Either is logged. Silent truncation (the old min-of-len
+// shortcut) would have masked mis-paired candidates.
 func (p *Pathfinder) emitPairs(ctx context.Context, r pipeline.VenueResult, otherVenue string, otherQuotes pricing.Quotes) {
-	// pricing.Quotes.Buy[i] and Sell[i] correspond to the same size
-	// within a single venue. Across venues, we assume both used the same
-	// configured sizes (true today because arbd binds the same size set
-	// at construction). The min guards against any future drift.
-	n := min(len(r.Quotes.Buy), len(otherQuotes.Buy))
-	for i := range n {
+	if len(r.Quotes.Buy) != len(otherQuotes.Buy) {
+		p.logger.Printf("pathfinder: size-set length mismatch at block %d between %s (%d) and %s (%d) — skipping pair",
+			r.Block.Number, r.Venue, len(r.Quotes.Buy), otherVenue, len(otherQuotes.Buy))
+		return
+	}
+	for i := range r.Quotes.Buy {
 		size := r.Quotes.Buy[i].Size
+		if !size.Equal(otherQuotes.Buy[i].Size) {
+			p.logger.Printf("pathfinder: size mismatch at index %d between %s (%s) and %s (%s) at block %d — skipping",
+				i, r.Venue, size, otherVenue, otherQuotes.Buy[i].Size, r.Block.Number)
+			continue
+		}
 
 		// Direction A: buy on r.Venue, sell on otherVenue.
 		// Requires a clean ask on r.Venue AND a clean bid on otherVenue.

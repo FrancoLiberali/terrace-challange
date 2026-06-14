@@ -288,6 +288,99 @@ func TestPathfinder_PerSizeErrorSkipsOnlyAffectedDirection(t *testing.T) {
 	<-runErr
 }
 
+func TestPathfinder_SizeSetLengthMismatchSkipsPair(t *testing.T) {
+	// Two venues at the same block but with different-length size sets.
+	// Cross-venue index alignment isn't a contract on pricing.Quotes, so
+	// the pathfinder must refuse to pair rather than silently truncating
+	// the longer slice (the old min-of-len shortcut would have done so
+	// and produced wrong candidates if the trailing indices were ever
+	// non-corresponding sizes).
+	var logBuf bytes.Buffer
+	p := newTestPathfinder(&logBuf)
+
+	results := make(chan pipeline.VenueResult, 2)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runErr := make(chan error, 1)
+	go func() { runErr <- p.Run(ctx, results) }()
+
+	// Binance with two sizes (1, 10).
+	results <- pipeline.VenueResult{Venue: "binance", Block: mkBlock(100), Quotes: mkQuotes("1680", "1679", "1681", "1678")}
+	// Uniswap with only one size (1) — length disagrees.
+	results <- pipeline.VenueResult{
+		Venue: "uniswap",
+		Block: mkBlock(100),
+		Quotes: pricing.Quotes{
+			Buy:  []pricing.Quote{{Size: dec("1"), Side: pricing.Buy, Price: dec("1685")}},
+			Sell: []pricing.Quote{{Size: dec("1"), Side: pricing.Sell, Price: dec("1675")}},
+		},
+	}
+
+	got := collectCandidates(t, p.Candidates())
+	if len(got) != 0 {
+		t.Errorf("expected 0 candidates on length mismatch, got %d: %+v", len(got), got)
+	}
+
+	cancel()
+	<-runErr
+
+	if !strings.Contains(logBuf.String(), "length mismatch") {
+		t.Errorf("expected length-mismatch log line, got: %q", logBuf.String())
+	}
+}
+
+func TestPathfinder_PerIndexSizeMismatchSkipsThatIndexOnly(t *testing.T) {
+	// Same lengths on both venues, but the second index is a different
+	// size on each venue. The pathfinder must pair the first index
+	// (aligned) and skip the second (mis-aligned) — not pair them as if
+	// they were the same size.
+	var logBuf bytes.Buffer
+	p := newTestPathfinder(&logBuf)
+
+	results := make(chan pipeline.VenueResult, 2)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runErr := make(chan error, 1)
+	go func() { runErr <- p.Run(ctx, results) }()
+
+	// Binance: sizes 1 and 10.
+	results <- pipeline.VenueResult{Venue: "binance", Block: mkBlock(100), Quotes: mkQuotes("1680", "1679", "1681", "1678")}
+	// Uniswap: sizes 1 and 100 — second index mis-aligned.
+	results <- pipeline.VenueResult{
+		Venue: "uniswap",
+		Block: mkBlock(100),
+		Quotes: pricing.Quotes{
+			Buy: []pricing.Quote{
+				{Size: dec("1"), Side: pricing.Buy, Price: dec("1685")},
+				{Size: dec("100"), Side: pricing.Buy, Price: dec("1690")},
+			},
+			Sell: []pricing.Quote{
+				{Size: dec("1"), Side: pricing.Sell, Price: dec("1675")},
+				{Size: dec("100"), Side: pricing.Sell, Price: dec("1670")},
+			},
+		},
+	}
+
+	got := collectCandidates(t, p.Candidates())
+	// Aligned size=1 produces both directions (2 candidates); the
+	// mis-aligned second index must be skipped entirely.
+	if len(got) != 2 {
+		t.Fatalf("expected 2 candidates (size=1 in both directions), got %d: %+v", len(got), got)
+	}
+	for _, c := range got {
+		if !c.Size.Equal(dec("1")) {
+			t.Errorf("only size=1 should have paired, got size=%s: %+v", c.Size, c)
+		}
+	}
+
+	cancel()
+	<-runErr
+
+	if !strings.Contains(logBuf.String(), "size mismatch at index 1") {
+		t.Errorf("expected size-mismatch log line for index 1, got: %q", logBuf.String())
+	}
+}
+
 func TestPathfinder_StopsOnContextCancel(t *testing.T) {
 	p := newTestPathfinder(io.Discard)
 	results := make(chan pipeline.VenueResult)
