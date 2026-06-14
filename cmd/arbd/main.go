@@ -36,13 +36,13 @@ var (
 		decimal.NewFromInt(100),
 	}
 
-	// Default cost model. Binance spot taker fee is 0.1% = 10 bps;
-	// Uniswap V3's 0.3% pool fee is already embedded in QuoterV2's
-	// output so the venue doesn't appear in the fee map. Gas units
-	// for the DEX leg travel on each CandidatePath, sourced from
-	// QuoterV2's per-call gasEstimate output.
+	// Default cost model. Trading fees are NOT here: each adapter folds
+	// its venue's intrinsic fees into the Price it returns (Binance's
+	// taker fee via binance.Symbol.TakerFeeBps, Uniswap V3's 0.3% pool
+	// fee already in QuoterV2's output). Gas units travel per-candidate
+	// from QuoterV2's per-call gasEstimate. The model just carries the
+	// profitability threshold.
 	defaultCostModel = arbitrage.CostModel{
-		VenueFeeBps:      map[string]int{"binance": 10},
 		MinNetProfitUSDC: decimal.NewFromInt(1),
 	}
 )
@@ -160,8 +160,7 @@ func printOpportunity(w io.Writer, op arbitrage.Opportunity) {
 		op.SpreadPerUnit.StringFixed(4),
 		op.SpreadPerUnit.Div(op.BuyPrice).Mul(decimal.NewFromInt(100)).StringFixed(4))
 	fmt.Fprintln(w)
-	fmt.Fprintf(w, "Gross Profit:      $%s\n", op.GrossProfit.StringFixed(2))
-	fmt.Fprintf(w, "Trading Fees:      $%s\n", op.TradingFees.StringFixed(2))
+	fmt.Fprintf(w, "Profit (post-fee): $%s  (already net of venue-intrinsic fees, gross of gas)\n", op.GrossProfit.StringFixed(2))
 	fmt.Fprintf(w, "Gas Cost (est):    $%s  (baseFee=%s gwei, ~%d gas)\n",
 		op.GasCostUSDC.StringFixed(4),
 		formatGwei(op.Block.BaseFee),

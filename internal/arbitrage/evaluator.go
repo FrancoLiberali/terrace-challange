@@ -12,17 +12,12 @@ import (
 	"github.com/FrancoLiberali/terrace-challenge/internal/pathfinder"
 )
 
-// CostModel parameterises the profitability calculation. Gas units come
-// from each CandidatePath itself (the adapter populates them per call —
-// QuoterV2 returns a per-quote estimate), so the model does not need a
-// global GasUnitsPerSwap.
+// CostModel parameterises the profitability calculation. Trading fees do
+// not appear here: each adapter folds its venue's intrinsic fees into
+// the Price it returns (see architecture.md decision 3), so the evaluator
+// only adds the costs that are NOT venue-intrinsic — currently just gas.
+// Gas units travel on each CandidatePath rather than the model.
 type CostModel struct {
-	// VenueFeeBps maps a venue name to its taker fee in basis points.
-	// Binance spot is 10 bps (0.1%); a venue not in the map is treated
-	// as fee-free at this layer (the DEX's 0.3% pool fee is already
-	// embedded in the QuoterV2 output and is NOT included here).
-	VenueFeeBps map[string]int
-
 	// MinNetProfitUSDC is the threshold IsProfitable compares NetProfit
 	// against. Decimal so callers can set fractional thresholds.
 	MinNetProfitUSDC decimal.Decimal
@@ -37,11 +32,10 @@ type CostModel struct {
 type Opportunity struct {
 	pathfinder.CandidatePath
 
-	SpreadPerUnit decimal.Decimal // SellPrice - BuyPrice
-	GrossProfit   decimal.Decimal // SpreadPerUnit × Size
-	TradingFees   decimal.Decimal // sum of per-venue taker fees
+	SpreadPerUnit decimal.Decimal // SellPrice - BuyPrice (both post-fee)
+	GrossProfit   decimal.Decimal // SpreadPerUnit × Size — already net of venue-intrinsic fees, gross of gas
 	GasCostUSDC   decimal.Decimal // gas estimate valued in USDC
-	NetProfit     decimal.Decimal // GrossProfit - TradingFees - GasCostUSDC
+	NetProfit     decimal.Decimal // GrossProfit - GasCostUSDC
 	NetProfitPct  decimal.Decimal // (NetProfit / CapitalUSDC) × 100
 	CapitalUSDC   decimal.Decimal // BuyPrice × Size — what you need to put up
 }
@@ -56,24 +50,21 @@ func NewEvaluator(model CostModel) *Evaluator {
 	return &Evaluator{model: model}
 }
 
-const (
-	// bpsDenominator converts basis points to a fraction (10 bps = 0.1%).
-	bpsDenominator = 10000
-	// weiToETHShift is the number of decimal places between wei and ETH.
-	weiToETHShift = 18
-)
+// weiToETHShift is the number of decimal places between wei and ETH.
+const weiToETHShift = 18
 
 // Evaluate computes the Opportunity for the candidate, regardless of
 // profitability. Callers use IsProfitable to filter.
+//
+// Trading fees are NOT subtracted here — they are already baked into the
+// candidate's BuyPrice and SellPrice by the per-venue adapters (see
+// pricing.Quote and architecture.md decision 3). The only cost the
+// evaluator adds is gas, which is per-transaction and therefore cannot
+// live on the per-unit price.
 func (e *Evaluator) Evaluate(path pathfinder.CandidatePath) Opportunity {
 	spreadPerUnit := path.SellPrice.Sub(path.BuyPrice)
 	grossProfit := spreadPerUnit.Mul(path.Size)
 	capital := path.BuyPrice.Mul(path.Size)
-
-	// Per-venue taker fees: each leg's fee, valued at that leg's
-	// notional. Venues not in the model contribute zero (the DEX case).
-	tradingFees := e.venueFee(path.BuyVenue, capital).
-		Add(e.venueFee(path.SellVenue, path.SellPrice.Mul(path.Size)))
 
 	// Gas cost: gasUnits × baseFee → wei → ETH → USDC (valued at
 	// BuyPrice as a reasonable per-block ETH→USDC reference).
@@ -82,7 +73,7 @@ func (e *Evaluator) Evaluate(path pathfinder.CandidatePath) Opportunity {
 	// two legs into CandidatePath.GasEstimate.
 	gasUSDC := gasCostUSDC(path.GasEstimate, path.Block.BaseFee, path.BuyPrice)
 
-	netProfit := grossProfit.Sub(tradingFees).Sub(gasUSDC)
+	netProfit := grossProfit.Sub(gasUSDC)
 
 	netProfitPct := decimal.Zero
 	if capital.IsPositive() {
@@ -93,7 +84,6 @@ func (e *Evaluator) Evaluate(path pathfinder.CandidatePath) Opportunity {
 		CandidatePath: path,
 		SpreadPerUnit: spreadPerUnit,
 		GrossProfit:   grossProfit,
-		TradingFees:   tradingFees,
 		GasCostUSDC:   gasUSDC,
 		NetProfit:     netProfit,
 		NetProfitPct:  netProfitPct,
@@ -105,19 +95,6 @@ func (e *Evaluator) Evaluate(path pathfinder.CandidatePath) Opportunity {
 // exceeds the configured threshold.
 func (e *Evaluator) IsProfitable(o Opportunity) bool {
 	return o.NetProfit.GreaterThan(e.model.MinNetProfitUSDC)
-}
-
-// venueFee returns the per-venue taker fee on the given notional (USDC).
-// Venues not configured contribute zero — DEX fees are baked into the
-// price upstream.
-func (e *Evaluator) venueFee(venue string, notional decimal.Decimal) decimal.Decimal {
-	bps, ok := e.model.VenueFeeBps[venue]
-	if !ok {
-		return decimal.Zero
-	}
-	return notional.
-		Mul(decimal.NewFromInt(int64(bps))).
-		Div(decimal.NewFromInt(bpsDenominator))
 }
 
 // gasCostUSDC converts gasUnits × baseFee (wei) to USDC using the given

@@ -66,15 +66,18 @@ func NewClient(baseURL string) *Client {
 	}
 }
 
-// EffectivePrices returns the slippage-aware effective per-unit price for
-// each (size, side) combination against the current orderbook for `symbol`.
-// Sizes must be in ascending order; the per-side processing relies on that
-// invariant to exit early on the first size that exceeds available depth.
+// EffectivePrices returns the slippage-aware, fee-adjusted effective
+// per-unit price for each (size, side) combination against the current
+// orderbook for `symbol`. Sizes must be in ascending order; the per-side
+// processing relies on that invariant to exit early on the first size
+// that exceeds available depth.
 //
-// Buy[i] and Sell[i] in the returned Quotes both refer to sizes[i]. Sizes
-// that exceed available depth on a given side are returned with
-// Quote.Err set to ErrInsufficientDepth; the top-level error is returned
-// only if fetching the orderbook itself failed.
+// Buy[i] and Sell[i] in the returned Quotes both refer to sizes[i]. Each
+// Price is net of the symbol's TakerFeeBps — Buy prices are inflated
+// (you pay more per unit), Sell prices are discounted (you receive less
+// per unit). Sizes that exceed available depth on a given side are
+// returned with Quote.Err set to ErrInsufficientDepth; the top-level
+// error is returned only if fetching the orderbook itself failed.
 func (c *Client) EffectivePrices(ctx context.Context, symbol Symbol, sizes []decimal.Decimal) (pricing.Quotes, error) {
 	// Per side, an output slice keyed by input-size index and a cursor for
 	// the first index still waiting for a fill. Because sizes are ascending
@@ -99,8 +102,8 @@ func (c *Client) EffectivePrices(ctx context.Context, symbol Symbol, sizes []dec
 		if err != nil {
 			return pricing.Quotes{}, err
 		}
-		buyFrom = fillSide(out.Buy, sizes, buyFrom, asks, pricing.Buy)
-		sellFrom = fillSide(out.Sell, sizes, sellFrom, bids, pricing.Sell)
+		buyFrom = fillSide(out.Buy, sizes, buyFrom, asks, pricing.Buy, symbol.TakerFeeBps)
+		sellFrom = fillSide(out.Sell, sizes, sellFrom, bids, pricing.Sell, symbol.TakerFeeBps)
 	}
 	markInsufficient(out.Buy, sizes, buyFrom, pricing.Buy)
 	markInsufficient(out.Sell, sizes, sellFrom, pricing.Sell)
@@ -109,14 +112,15 @@ func (c *Client) EffectivePrices(ctx context.Context, symbol Symbol, sizes []dec
 }
 
 // fillSide walks `levels` for sizes[from:] in ascending order, writing the
-// resulting Quote into out[i]. It returns the index of the first size that
-// did not fit — because sizes are ascending, every larger size will also
-// have failed at this tier and must be retried at a deeper one.
-func fillSide(out []pricing.Quote, sizes []decimal.Decimal, from int, levels []level, side pricing.Side) int {
+// resulting fee-adjusted Quote into out[i]. It returns the index of the
+// first size that did not fit — because sizes are ascending, every larger
+// size will also have failed at this tier and must be retried at a deeper
+// one.
+func fillSide(out []pricing.Quote, sizes []decimal.Decimal, from int, levels []level, side pricing.Side, feeBps uint32) int {
 	for i := from; i < len(sizes); i++ {
 		price, _, err := walkOrderbook(levels, sizes[i])
 		if err == nil {
-			out[i] = pricing.Quote{Size: sizes[i], Side: side, Price: price}
+			out[i] = pricing.Quote{Size: sizes[i], Side: side, Price: applyTakerFee(price, side, feeBps)}
 			continue
 		}
 		if errors.Is(err, ErrInsufficientDepth) {
@@ -127,6 +131,30 @@ func fillSide(out []pricing.Quote, sizes []decimal.Decimal, from int, levels []l
 		out[i] = pricing.Quote{Size: sizes[i], Side: side, Err: err}
 	}
 	return len(sizes)
+}
+
+// bpsDenominator converts basis points to a fraction (10 bps = 0.001).
+const bpsDenominator = 10000
+
+// applyTakerFee adjusts an orderbook VWAP into the effective per-unit
+// price the trader actually pays (Buy) or receives (Sell) after the
+// venue's taker fee. feeBps is in basis points (10 = 0.1%). Returns
+// price unchanged when feeBps is zero.
+func applyTakerFee(price decimal.Decimal, side pricing.Side, feeBps uint32) decimal.Decimal {
+	if feeBps == 0 {
+		return price
+	}
+	feeRate := decimal.NewFromInt(int64(feeBps)).Div(decimal.NewFromInt(bpsDenominator))
+	switch side {
+	case pricing.Buy:
+		// You pay the venue → effective ask = orderbook_ask × (1 + fee).
+		return price.Mul(decimal.NewFromInt(1).Add(feeRate))
+	case pricing.Sell:
+		// Venue pays you → effective bid = orderbook_bid × (1 - fee).
+		return price.Mul(decimal.NewFromInt(1).Sub(feeRate))
+	default:
+		return price
+	}
 }
 
 // markInsufficient fills out[from:] with ErrInsufficientDepth quotes for the

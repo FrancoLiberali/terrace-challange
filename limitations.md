@@ -15,9 +15,10 @@ The scope of the service is **detection only**. Several limitations below would 
 - [5. Execution risk is asymmetric between the two venues](#5-execution-risk-is-asymmetric-between-the-two-venues)
 - [6. Chain reorganizations are not handled](#6-chain-reorganizations-are-not-handled)
 - [7. The detector does not model probability of inclusion or gas auctions](#7-the-detector-does-not-model-probability-of-inclusion-or-gas-auctions)
-- [8. Single-pool, single-fee-tier simplification](#8-single-pool-single-fee-tier-simplification)
-- [9. Single CEX, single DEX, single pair](#9-single-cex-single-dex-single-pair)
-- [10. The detector assumes liquidity is available at the moment of observation](#10-the-detector-assumes-liquidity-is-available-at-the-moment-of-observation)
+- [8. Trading fees use a hardcoded schedule, not the operator's live per-account rate](#8-trading-fees-use-a-hardcoded-schedule-not-the-operators-live-per-account-rate)
+- [9. Single-pool, single-fee-tier simplification](#9-single-pool-single-fee-tier-simplification)
+- [10. Single CEX, single DEX, single pair](#10-single-cex-single-dex-single-pair)
+- [11. The detector assumes liquidity is available at the moment of observation](#11-the-detector-assumes-liquidity-is-available-at-the-moment-of-observation)
 - [What a production trading version would add](#what-a-production-trading-version-would-add)
 
 ---
@@ -149,19 +150,34 @@ The net effect is that QuoterV2's estimate typically lands within 10–20% of ac
 
 ---
 
-## 8. Single-pool, single-fee-tier simplification
+## 8. Trading fees use a hardcoded schedule, not the operator's live per-account rate
+
+The Binance taker fee is encoded as **10 bps (0.1%)** on `binance.Symbol.TakerFeeBps` — the [published default Spot fee](https://www.binance.com/en/fee/schedule) for a Regular User. This is a defensible default but does not match every operator's actual fee:
+
+- **BNB discount**: holding BNB and enabling the discount toggle drops the taker fee to 7.5 bps (25% off).
+- **VIP tier**: high-volume accounts (≥ $50M monthly volume) step down through VIP 1–9, with VIP 9 paying as little as 2.4 bps.
+- **Per-market variation**: stablecoin-only pairs (e.g. USDC-USDT) often carry 0 bps; new listings may carry promotional rates. The constant lives per-`Symbol` precisely so each market can carry a different value, but every value is still hardcoded — there is no live discovery.
+- **Schedule changes over time**: Binance revises its fee tiers periodically; the constant captures the schedule as of writing.
+
+The bias is consistently **conservative**: the detector assumes the operator pays the highest documented rate, so the bot under-reports profit (missing opportunities a discounted operator could actually capture) rather than over-reports.
+
+The `Symbol.TakerFeeBps` field is the seam for a more accurate source. A production-grade adapter would fetch the operator's actual taker fee at startup via Binance's `/sapi/v1/asset/tradeFee` endpoint and refresh it periodically — the only change needed elsewhere is replacing the hardcoded constant with the fetched value.
+
+---
+
+## 9. Single-pool, single-fee-tier simplification
 
 The challenge's hints, expected output, and example code all point to the Uniswap V3 0.3% fee-tier ETH-USDC pool (`0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640`), and the detector follows that convention by querying only that pool. In reality ETH-USDC has multiple Uniswap V3 pools at different fee tiers (0.05%, 0.3%, 1%), each with its own liquidity profile and price. A real router would query all of them per block and pick the best effective price per trade size, and a real arbitrageur might split a large order across several pools at once. The detector adopts the challenge's implied scope and explicitly trades off completeness for simplicity.
 
 ---
 
-## 9. Single CEX, single DEX, single pair
+## 10. Single CEX, single DEX, single pair
 
 The detector observes one CEX (Binance), one DEX (Uniswap V3), one trading pair (ETH-USDC). The architecture is designed to be extensible through interface boundaries, but no other venue is wired up. Any arbitrage opportunity that exists only because of a third venue (for example, Coinbase trading differently from Binance, or Sushiswap diverging from Uniswap) is entirely invisible.
 
 ---
 
-## 10. The detector assumes liquidity is available at the moment of observation
+## 11. The detector assumes liquidity is available at the moment of observation
 
 The Binance orderbook is snapshotted via REST, which means it represents the state at the moment of fetch but says nothing about what will exist a few hundred milliseconds later when a real trader would act. The pool state, similarly, is the state at the queried block, not the state at execution. Both observations are point-in-time and can become stale even within a single block window.
 

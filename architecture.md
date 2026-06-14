@@ -265,6 +265,10 @@ Both adapters produce the **same output type**: a list of effective prices, one 
 
 The pricing math itself (walking the book, dividing raw amounts) is a shared concern within the adapter layer, applied by each adapter as part of producing its output. It is not a separate pipeline stage: the math is centralized and conceptually shared between both adapters, but it is exercised inside each adapter so the data emerging at the adapter boundary is already in the canonical shape.
 
+**Each adapter holds its own venue-specific fee schedule** (e.g., `binance.Symbol.TakerFeeBps`); the downstream cost model does NOT carry a venue-fee map. This keeps adapter contracts symmetric — Buy prices are the price you actually pay per unit, Sell prices the price you actually receive — and means adding a new venue is a self-contained change inside one package. It also makes the design graph-ready: in the multi-feature evolution described later in this document, each edge already carries its true effective rate, so algorithms can compose paths without needing per-venue cost knowledge.
+
+Gas is intentionally NOT folded into Price because it is per-transaction, not per-unit; it travels alongside the price on each Quote (and is summed across legs on the CandidatePath) so the Evaluator can apply it once at the path level.
+
 **Why**: letting the detector or pipeline receive two different venue-specific input shapes would break the same separation-of-concerns principle that motivates having adapters in the first place. The detector should never need to know what venue an effective price came from.
 
 **Alternative considered**: place the unit-conversion and slippage math in a separate downstream pipeline stage that consumes raw venue-specific data emitted by each adapter, normalizes it, and only then hands a unified shape to the detector. Rejected because it would force that downstream stage to know venue-specific raw formats — undoing the separation-of-concerns that motivates having adapters at all — and it would add a pipeline stage whose only job is shape conversion.

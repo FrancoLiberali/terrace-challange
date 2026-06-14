@@ -51,6 +51,8 @@ func TestClient_EffectivePrices(t *testing.T) {
 	}
 
 	// Buy[i] and Sell[i] correspond to sizes[i].
+	// Expected prices are post-fee: SymbolETHUSDC.TakerFeeBps is 10 bps.
+	// BUY inflates by × 1.001; SELL discounts by × 0.999. See applyTakerFee.
 	checks := []struct {
 		q         pricing.Quote
 		wantSize  string
@@ -58,14 +60,14 @@ func TestClient_EffectivePrices(t *testing.T) {
 		wantPrice string
 		comment   string
 	}{
-		// 1 ETH BUY eats the lowest ask: 1 ETH at 2250.10 → 2250.10
-		{quotes.Buy[0], "1", pricing.Buy, "2250.10", "1 ETH BUY"},
-		// 1 ETH SELL eats the highest bid: 1 ETH at 2249.50 → 2249.50
-		{quotes.Sell[0], "1", pricing.Sell, "2249.50", "1 ETH SELL"},
-		// 10 ETH BUY: 3.5 at 2250.10 + 6.5 at 2250.20 = 22501.65 → /10 = 2250.165
-		{quotes.Buy[1], "10", pricing.Buy, "2250.165", "10 ETH BUY"},
-		// 10 ETH SELL: 8.2 at 2249.50 (18445.90) + 1.8 at 2249.40 (4048.92) = 22494.82 → /10 = 2249.482
-		{quotes.Sell[1], "10", pricing.Sell, "2249.482", "10 ETH SELL"},
+		// 1 ETH BUY:  ask=2250.10 → walk VWAP = 2250.10 → ×1.001 = 2252.3501
+		{quotes.Buy[0], "1", pricing.Buy, "2252.3501", "1 ETH BUY"},
+		// 1 ETH SELL: bid=2249.50 → walk VWAP = 2249.50 → ×0.999 = 2247.2505
+		{quotes.Sell[0], "1", pricing.Sell, "2247.2505", "1 ETH SELL"},
+		// 10 ETH BUY: 3.5@2250.10 + 6.5@2250.20 = 22501.65 → /10 = 2250.165 → ×1.001 = 2252.415165
+		{quotes.Buy[1], "10", pricing.Buy, "2252.415165", "10 ETH BUY"},
+		// 10 ETH SELL: 8.2@2249.50 + 1.8@2249.40 = 22494.82 → /10 = 2249.482 → ×0.999 = 2247.232518
+		{quotes.Sell[1], "10", pricing.Sell, "2247.232518", "10 ETH SELL"},
 	}
 	for _, c := range checks {
 		if !c.q.Size.Equal(dec(c.wantSize)) {
@@ -101,14 +103,14 @@ func TestClient_EffectivePrices_PerRowInsufficientDepth(t *testing.T) {
 			body:      `{"lastUpdateId":1,"bids":[["2249.50","12.0"]],"asks":[["2250.10","2.0"]]}`,
 			failSide:  pricing.Buy,
 			succSide:  pricing.Sell,
-			succPrice: "2249.50",
+			succPrice: "2247.2505", // 2249.50 × (1 - 0.001)
 		},
 		{
 			name:      "sell fails / buy succeeds",
 			body:      `{"lastUpdateId":1,"bids":[["2249.50","2.0"]],"asks":[["2250.10","12.0"]]}`,
 			failSide:  pricing.Sell,
 			succSide:  pricing.Buy,
-			succPrice: "2250.10",
+			succPrice: "2252.3501", // 2250.10 × (1 + 0.001)
 		},
 	}
 	for _, tc := range cases {
