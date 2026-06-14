@@ -26,6 +26,7 @@ The architecture is deliberately a **single Go process** with no message broker 
   - [Message broker between the block clock and adapters](#message-broker-between-the-block-clock-and-adapters)
   - [Horizontal scaling per adapter](#horizontal-scaling-per-adapter)
   - [Pathfinder and Evaluator as stateless consumers](#pathfinder-and-evaluator-as-stateless-consumers)
+  - [Multi-feature evolution: stateful market graph + per-service derived state](#multi-feature-evolution-stateful-market-graph--per-service-derived-state)
   - [State and history store](#state-and-history-store)
   - [Observability stack](#observability-stack)
   - [Other production concerns](#other-production-concerns)
@@ -264,6 +265,10 @@ Both adapters produce the **same output type**: a list of effective prices, one 
 
 The pricing math itself (walking the book, dividing raw amounts) is a shared concern within the adapter layer, applied by each adapter as part of producing its output. It is not a separate pipeline stage: the math is centralized and conceptually shared between both adapters, but it is exercised inside each adapter so the data emerging at the adapter boundary is already in the canonical shape.
 
+**Each adapter holds its own venue-specific fee schedule** (e.g., `binance.Symbol.TakerFeeBps`); the downstream cost model does NOT carry a venue-fee map. This keeps adapter contracts symmetric — Buy prices are the price you actually pay per unit, Sell prices the price you actually receive — and means adding a new venue is a self-contained change inside one package. It also makes the design graph-ready: in the multi-feature evolution described later in this document, each edge already carries its true effective rate, so algorithms can compose paths without needing per-venue cost knowledge.
+
+Gas is intentionally NOT folded into Price because it is per-transaction, not per-unit; it travels alongside the price on each Quote (and is summed across legs on the CandidatePath) so the Evaluator can apply it once at the path level.
+
 **Why**: letting the detector or pipeline receive two different venue-specific input shapes would break the same separation-of-concerns principle that motivates having adapters in the first place. The detector should never need to know what venue an effective price came from.
 
 **Alternative considered**: place the unit-conversion and slippage math in a separate downstream pipeline stage that consumes raw venue-specific data emitted by each adapter, normalizes it, and only then hands a unified shape to the detector. Rejected because it would force that downstream stage to know venue-specific raw formats — undoing the separation-of-concerns that motivates having adapters at all — and it would add a pipeline stage whose only job is shape conversion.
@@ -407,6 +412,24 @@ Sharding strategy: each adapter instance is assigned a subset of pairs (consiste
 The pairing-and-detection service subscribes to per-venue effective-price events and matches them by `(block_number, pair)`. When all expected venues for a block report in (or a timeout fires), the Pathfinder enumerates candidate paths across all reporting venues (this is where multi-venue, order-splitting, and multi-hop routing logic naturally grows), and the Profitability Evaluator publishes `Opportunity` events for those that clear the threshold.
 
 Because both stages are stateless (their only inputs are the messages on the broker), they can be horizontally scaled with no coordination beyond the broker's consumer-group semantics.
+
+### Multi-feature evolution: stateful market graph + per-service derived state
+
+The Pathfinder shape described above handles the single-feature case (arbitrage detection across N venues for a fixed pair) cleanly. A real multi-feature system — like the smart-order router Terrace operates — serves several features over the same market-data substrate: routing, arbitrage detection, liquidity monitoring, price oracles, archival analytics. The design has to evolve to support that, and the current in-process Pathfinder is the part that doesn't extend gracefully.
+
+At multi-feature scale, the Pathfinder is no longer a "correlate per-block snapshots and emit candidate paths" component. It becomes a **stateful market graph**:
+
+- **Nodes**: tokens.
+- **Edges**: every (tokenA, tokenB, venue, pool) combination, each with a quote function (slippage-aware, fee-aware) and current liquidity.
+- **Updated continuously** by the per-venue snapshot stream the dispatcher already produces.
+
+Algorithms then run over this graph rather than being baked into the pairing step. Arbitrage detection becomes negative-weight cycle detection (e.g., Bellman-Ford on `-log(rate × (1 - fee))` edge weights) — and the current 2-venue in-process implementation is just the degenerate 2-hop case of this. Routing for client orders becomes shortest-path search. Other features (liquidity monitoring, price oracles) run their own algorithms over the same graph structure.
+
+The thing that does not scale in the present single-feature design is the explicit "correlate these venues and emit candidates" logic — at N venues and K algorithms it becomes a quadratic mess of cross-cutting concerns. The graph representation factors the pairing into the data structure itself, so any algorithm can answer "what venues offer this pair?" without the Pathfinder having to enumerate up front.
+
+**Each algorithm or feature owns its own derived state.** The thing shared across services is the broker event stream, not a single graph instance. Each consumer materializes the projection of the graph that's optimized for its query pattern — the arb detector indexes cycles, the router indexes adjacency lists, the price oracle indexes per-pair mid-prices, the archive appends-only — all from the same upstream stream of normalized market-data events. This keeps the failure and scaling boundaries per-feature: any service can be scaled, redeployed, or rebuilt from the event log without touching the others.
+
+The dispatcher / `pricing.Quote` / per-venue snapshotter shapes carry over unchanged into that world; the Pathfinder shape is the part that gets replaced.
 
 ### State and history store
 

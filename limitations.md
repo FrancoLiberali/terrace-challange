@@ -15,9 +15,10 @@ The scope of the service is **detection only**. Several limitations below would 
 - [5. Execution risk is asymmetric between the two venues](#5-execution-risk-is-asymmetric-between-the-two-venues)
 - [6. Chain reorganizations are not handled](#6-chain-reorganizations-are-not-handled)
 - [7. The detector does not model probability of inclusion or gas auctions](#7-the-detector-does-not-model-probability-of-inclusion-or-gas-auctions)
-- [8. Single-pool, single-fee-tier simplification](#8-single-pool-single-fee-tier-simplification)
-- [9. Single CEX, single DEX, single pair](#9-single-cex-single-dex-single-pair)
-- [10. The detector assumes liquidity is available at the moment of observation](#10-the-detector-assumes-liquidity-is-available-at-the-moment-of-observation)
+- [8. Trading fees use a hardcoded schedule, not the operator's live per-account rate](#8-trading-fees-use-a-hardcoded-schedule-not-the-operators-live-per-account-rate)
+- [9. Single-pool, single-fee-tier simplification](#9-single-pool-single-fee-tier-simplification)
+- [10. Single CEX, single DEX, single pair](#10-single-cex-single-dex-single-pair)
+- [11. The detector assumes liquidity is available at the moment of observation](#11-the-detector-assumes-liquidity-is-available-at-the-moment-of-observation)
 - [What a production trading version would add](#what-a-production-trading-version-would-add)
 
 ---
@@ -137,21 +138,68 @@ where the priority fee (a.k.a. "tip") is set per-transaction by the sender and c
 
 A production-grade cost model would estimate a competitive priority fee at the moment of submission — e.g., via `eth_feeHistory` + a percentile heuristic, or a dedicated gas oracle — and add it to the base fee before subtracting the resulting `effectiveGasPrice × gasUnits` from the spread.
 
+### Gas units: QuoterV2 simulation, not actual mined-block usage
+
+The DEX leg's gas units come from QuoterV2's per-call `gasEstimate` output — the contract's own simulation of the swap against the current pool state. This is more accurate than a hardcoded rule of thumb (it accounts for the actual number of ticks the swap would cross at this size, current liquidity, and current price), but it remains an estimate:
+
+- It simulates against the pool state **at the block being queried**. By the time a hypothetical transaction was mined, other swaps in the same block could have moved the pool, changing the number of ticks the swap actually crosses.
+- It does not include the **calling-contract overhead** (SwapRouter / multicall wrappers, signature checks, approval logic). A real on-chain swap through the production router adds roughly 5–15k gas above the raw pool interaction.
+- It does not model **cold-vs-warm storage** costs for slots that the executing transaction would touch — those depend on what other transactions ran before it in the same block.
+
+The net effect is that QuoterV2's estimate typically lands within 10–20% of actual mined-block gas usage, biased on the conservative (lower) side. This shares direction with the priority-fee omission described above — both make the cost model under-report gas — but the magnitude is much smaller than the priority-fee gap.
+
+### Gas denomination: converted to USDC via the candidate's `BuyPrice`, not a dedicated reference price
+
+The detector reports gas cost in USDC: `gasUnits × baseFee → wei → ETH → USDC`. The ETH→USDC step uses the candidate's own `BuyPrice` as the reference, which works only because the pair is ETH-USDC and `BuyPrice` happens to be "USDC per ETH" — exactly the number the gas conversion needs.
+
+The shortcut breaks the moment the detector extends to other pairs or chains:
+
+- **Other quote tokens** (e.g. ETH-DAI): `BuyPrice` is "DAI per ETH" — the conversion produces gas cost in DAI, not USDC.
+- **Other base tokens** (e.g. WBTC-USDC): `BuyPrice` is "USDC per WBTC" — the multiplication doesn't yield a meaningful number at all (gas is in ETH, not WBTC).
+- **Other chains** (Polygon, Arbitrum): gas is paid in the chain's native token (MATIC, etc.), not the asset being traded.
+
+Architecturally the gas-cost step inside the evaluator is fusing two responsibilities: **arithmetic** (gas cost in the chain's native gas token) and **denomination** (expressing that cost in the operator's reporting currency). A multi-pair / multi-chain extension would split them — carry gas in its native unit through the evaluator and convert to the reporting currency at the alert boundary, using a gas-token reference price sourced independently of any one trade pair.
+
+For the single-pair, single-chain scope here, the conflation is harmless: `BuyPrice` happens to be the right ETH/USDC reference. The limitation is shape, not correctness.
+
+### Pre-funded gas reserve: assumed available, not modelled
+
+Gas on Ethereum is paid in ETH out of the executing account's balance at the moment of submission, before any swap output arrives. The operator must hold an ETH reserve in that account — separate from the USDC trading capital — large enough to cover gas for every transaction they intend to submit. The detector assumes this reserve is present and unbounded: per-trade gas is subtracted from the spread for profitability purposes, but the operational prerequisite of *having ETH on hand to pay it* is not modelled.
+
+For a single arb the reserve is trivial (sub-cent at current base fees). Over a long-running session at scale it is non-trivial: the reserve depletes with every transaction, must be topped up from profits, and a depleted reserve halts DEX-side execution silently.
+
+A production trading version would either maintain an explicit gas float — monitored separately from trading capital, gated by a low-water alert — or submit DEX legs as Flashbots bundles that pay the builder bribe atomically out of the arb's own swap proceeds, dissolving the prerequisite in steady state. The bundle path requires the private-mempool stack already noted in §4.
+
 ---
 
-## 8. Single-pool, single-fee-tier simplification
+## 8. Trading fees use a hardcoded schedule, not the operator's live per-account rate
+
+The Binance taker fee is encoded as **10 bps (0.1%)** on `binance.Symbol.TakerFeeBps` — the [published default Spot fee](https://www.binance.com/en/fee/schedule) for a Regular User. This is a defensible default but does not match every operator's actual fee:
+
+- **BNB discount**: holding BNB and enabling the discount toggle drops the taker fee to 7.5 bps (25% off).
+- **VIP tier**: high-volume accounts (≥ $50M monthly volume) step down through VIP 1–9, with VIP 9 paying as little as 2.4 bps.
+- **Per-market variation**: stablecoin-only pairs (e.g. USDC-USDT) often carry 0 bps; new listings may carry promotional rates. The constant lives per-`Symbol` precisely so each market can carry a different value, but every value is still hardcoded — there is no live discovery.
+- **Schedule changes over time**: Binance revises its fee tiers periodically; the constant captures the schedule as of writing.
+
+The bias is consistently **conservative**: the detector assumes the operator pays the highest documented rate, so the bot under-reports profit (missing opportunities a discounted operator could actually capture) rather than over-reports.
+
+The `Symbol.TakerFeeBps` field is the seam for a more accurate source. A production-grade adapter would fetch the operator's actual taker fee at startup via Binance's `/sapi/v1/asset/tradeFee` endpoint and refresh it periodically — the only change needed elsewhere is replacing the hardcoded constant with the fetched value.
+
+---
+
+## 9. Single-pool, single-fee-tier simplification
 
 The challenge's hints, expected output, and example code all point to the Uniswap V3 0.3% fee-tier ETH-USDC pool (`0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640`), and the detector follows that convention by querying only that pool. In reality ETH-USDC has multiple Uniswap V3 pools at different fee tiers (0.05%, 0.3%, 1%), each with its own liquidity profile and price. A real router would query all of them per block and pick the best effective price per trade size, and a real arbitrageur might split a large order across several pools at once. The detector adopts the challenge's implied scope and explicitly trades off completeness for simplicity.
 
 ---
 
-## 9. Single CEX, single DEX, single pair
+## 10. Single CEX, single DEX, single pair
 
 The detector observes one CEX (Binance), one DEX (Uniswap V3), one trading pair (ETH-USDC). The architecture is designed to be extensible through interface boundaries, but no other venue is wired up. Any arbitrage opportunity that exists only because of a third venue (for example, Coinbase trading differently from Binance, or Sushiswap diverging from Uniswap) is entirely invisible.
 
 ---
 
-## 10. The detector assumes liquidity is available at the moment of observation
+## 11. The detector assumes liquidity is available at the moment of observation
 
 The Binance orderbook is snapshotted via REST, which means it represents the state at the moment of fetch but says nothing about what will exist a few hundred milliseconds later when a real trader would act. The pool state, similarly, is the state at the queried block, not the state at execution. Both observations are point-in-time and can become stale even within a single block window.
 

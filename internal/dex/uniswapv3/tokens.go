@@ -49,7 +49,7 @@ type Pool struct {
 const feeTier03Percent uint32 = 3000
 
 // PoolETHUSDC03 targets the 0.3% fee-tier ETH-USDC pool — the one the
-// challenge implies and that limitations.md §8 documents as a deliberate
+// challenge implies and that limitations.md §9 documents as a deliberate
 // single-pool simplification.
 var PoolETHUSDC03 = Pool{
 	Base:  WETH,
