@@ -22,6 +22,8 @@ cp .env.example .env
 # Edit .env and fill in your Alchemy HTTPS + WSS URLs.
 ```
 
+Both paths below run arbd in the foreground until you stop it — **Ctrl+C** in an interactive shell, or wrap with `timeout` for a bounded sanity check (`timeout 30 make run`, `timeout 30 make docker-run`). SIGTERM propagates cleanly through the make → (docker →) arbd chain.
+
 ### Path A — Docker (requires Docker only)
 
 ```bash
@@ -29,7 +31,7 @@ make docker-build
 make docker-run
 ```
 
-`docker-build` builds a multi-stage image (Go for build, distroless for runtime, ~15MB total). `docker-run` invokes `docker run --rm --env-file .env terrace-challenge` — credentials and runtime mode flow in from your local `.env`; no secrets are baked into the image. `config.yaml` is included; override it by mounting one at `/app/config.yaml`.
+`docker-build` builds a multi-stage image (Go for build, distroless for runtime, ~18MB total). `docker-run` invokes `docker run --rm --env-file .env terrace-challenge` — credentials and runtime mode flow in from your local `.env`; no secrets are baked into the image. `config.yaml` is included; override it by mounting one at `/app/config.yaml`.
 
 ### Path B — native Go (requires Go 1.25+)
 
