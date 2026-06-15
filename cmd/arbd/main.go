@@ -106,11 +106,11 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.level})))
+	slog.SetDefault(slog.New(newSlogHandler(cfg.pretty, &slog.HandlerOptions{Level: cfg.level})))
 
 	// alertLogger emits unconditionally — the alert is the bot's
 	// product, so LOG_LEVEL must not be able to suppress it.
-	alertLogger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	alertLogger := slog.New(newSlogHandler(cfg.pretty, nil))
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -174,6 +174,13 @@ func run() error {
 	consume(os.Stdout, pf.Candidates(), ev, cfg.pretty, alertLogger)
 
 	return awaitShutdown(subErr, dispErr, pfErr)
+}
+
+func newSlogHandler(pretty bool, opts *slog.HandlerOptions) slog.Handler {
+	if pretty {
+		return slog.NewTextHandler(os.Stderr, opts)
+	}
+	return slog.NewJSONHandler(os.Stderr, opts)
 }
 
 func newBreaker(venue string) *resilience.CircuitBreaker {
