@@ -10,13 +10,9 @@ The bot subscribes to Ethereum's `newHeads` stream, fetches a fee-adjusted Binan
 
 ## Quickstart
 
-Five minutes from clone to first block evaluated.
+Five minutes from clone to first block evaluated. Pick the path that matches what's installed locally.
 
-**Prerequisites:**
-- Go 1.25+ (`go version`)
-- A free Alchemy / Infura key for Ethereum Mainnet — used for the HTTP RPC and the WebSocket `newHeads` subscription. Both URLs come from the same provider app.
-
-**Steps:**
+**Prerequisites (both paths):** a free Alchemy / Infura key for Ethereum Mainnet — used for the HTTP RPC and the WebSocket `newHeads` subscription. Both URLs come from the same provider app.
 
 ```bash
 git clone https://github.com/FrancoLiberali/terrace-challenge.git
@@ -24,19 +20,36 @@ cd terrace-challenge
 
 cp .env.example .env
 # Edit .env and fill in your Alchemy HTTPS + WSS URLs.
+```
 
+Both paths below run arbd in the foreground until you stop it — **Ctrl+C** in an interactive shell, or wrap with `timeout` for a bounded sanity check (`timeout 30 make run`, `timeout 30 make docker-run`). SIGTERM propagates cleanly through the make → (docker →) arbd chain.
+
+### Path A — Docker (requires Docker only)
+
+```bash
+make docker-build
+make docker-run
+```
+
+`docker-build` builds a multi-stage image (Go for build, distroless for runtime, ~18MB total). `docker-run` invokes `docker run --rm --env-file .env terrace-challenge` — credentials and runtime mode flow in from your local `.env`; no secrets are baked into the image. `config.yaml` is included; override it by mounting one at `/app/config.yaml`.
+
+### Path B — native Go (requires Go 1.25+)
+
+```bash
 make run
 ```
 
-That's it. With `PRETTY_ALERTS=true` (the default in `.env.example`) you'll see a banner on stdout and structured slog records on stderr. Opportunities are emitted as both a structured slog event and a multi-line human-readable block.
-
-The standalone diagnostic probes from earlier steps are also available:
+The standalone diagnostic probes are also available:
 
 ```bash
 make probe-binance   # walk the Binance orderbook for the configured sizes
 make probe-uniswap   # one QuoterV2 eth_call per (size, side)
 make probe-chain     # subscribe to newHeads and print one line per block
 ```
+
+---
+
+With `PRETTY_ALERTS=true` (the default in `.env.example`) you'll see a banner on stdout and structured slog records on stderr. Opportunities are emitted as both a structured slog event and a multi-line human-readable block.
 
 ## Configuration
 

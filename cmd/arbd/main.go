@@ -60,7 +60,11 @@ type envConfig struct {
 }
 
 func loadEnv() (envConfig, error) {
-	if err := godotenv.Load(); err != nil {
+	// godotenv.Load is best-effort: if .env exists it's loaded into
+	// the process environment, but a missing file is fine — the
+	// expected case in Docker / CI where env vars are injected by
+	// the runtime. A malformed .env is still surfaced.
+	if err := godotenv.Load(); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return envConfig{}, fmt.Errorf("load .env: %w", err)
 	}
 	cfg := envConfig{

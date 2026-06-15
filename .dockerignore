@@ -1,0 +1,26 @@
+# Secrets — never embed in the image.
+.env
+.env.*
+
+# VCS / tooling / docs.
+.git
+.github
+.gitignore
+.golangci.yml
+.idea
+.vscode
+sonar-project.properties
+Makefile
+*.md
+challenge.pdf
+
+# Build output / test artefacts.
+bin
+*.test
+*.out
+coverage.*
+*.coverprofile
+
+# Tests aren't compiled by `go build ./cmd/arbd` but excluding them
+# keeps the build context tight.
+**/*_test.go
