@@ -27,6 +27,12 @@ go.work.sum
 # env file
 .env
 
+# make build output
+/bin/
+
+# Challenge brief — already in the repo as CHALLENGE.md.
+challenge.pdf
+
 # Editor/IDE
 # .idea/
 # .vscode/

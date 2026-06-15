@@ -39,14 +39,13 @@ type Dispatcher struct {
 	out     chan VenueResult
 }
 
-const defaultCallTimeout = 8 * time.Second
-
 // NewDispatcher wires the given venues (keyed by venue name) with the
-// default per-call timeout.
-func NewDispatcher(venues map[string]Snapshotter) *Dispatcher {
+// supplied per-call timeout. The timeout bounds each Snapshot's
+// execution; a hung venue can't stall the whole pipeline past one block.
+func NewDispatcher(venues map[string]Snapshotter, callTimeout time.Duration) *Dispatcher {
 	return &Dispatcher{
 		venues:  venues,
-		timeout: defaultCallTimeout,
+		timeout: callTimeout,
 		out:     make(chan VenueResult),
 	}
 }

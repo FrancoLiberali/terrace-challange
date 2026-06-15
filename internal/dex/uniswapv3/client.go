@@ -18,9 +18,6 @@ import (
 	"github.com/FrancoLiberali/terrace-challenge/internal/pricing"
 )
 
-// QuoterV2Address is the deployed QuoterV2 contract on Ethereum mainnet.
-var QuoterV2Address = common.HexToAddress("0x61fFE014bA17989E743c5F6cB21bF9697530B21e")
-
 // Client wraps an Ethereum RPC client to issue QuoterV2 simulated-swap
 // calls. Resilience concerns (retry, rate limit, circuit breaker) are
 // applied at the underlying *http.Client transport, so this client
@@ -32,18 +29,18 @@ type Client struct {
 }
 
 // NewClient dials the given Ethereum JSON-RPC endpoint with the default
-// http.Client. Suitable for tests and the probe binary; arbd uses
-// NewClientWithHTTP to inject a transport with retry / breaker /
-// rate-limit layers.
-func NewClient(rpcURL string) (*Client, error) {
-	return NewClientWithHTTP(rpcURL, http.DefaultClient)
+// http.Client and targets the supplied QuoterV2 deployment. Suitable
+// for tests and the probe binary; arbd uses NewClientWithHTTP to
+// inject a transport with retry / breaker / rate-limit layers.
+func NewClient(rpcURL string, quoter common.Address) (*Client, error) {
+	return NewClientWithHTTP(rpcURL, quoter, http.DefaultClient)
 }
 
 // NewClientWithHTTP is NewClient with a caller-supplied http.Client.
 // The client's Transport carries whatever resilience layers the caller
 // has composed (see internal/resilience.NewHTTPClient); both the
 // JSON-RPC dial and every subsequent eth_call go through it.
-func NewClientWithHTTP(rpcURL string, httpClient *http.Client) (*Client, error) {
+func NewClientWithHTTP(rpcURL string, quoter common.Address, httpClient *http.Client) (*Client, error) {
 	rpcClient, err := rpc.DialOptions(context.Background(), rpcURL, rpc.WithHTTPClient(httpClient))
 	if err != nil {
 		return nil, fmt.Errorf("dial RPC: %w", err)
@@ -53,7 +50,7 @@ func NewClientWithHTTP(rpcURL string, httpClient *http.Client) (*Client, error) 
 		rpcClient.Close()
 		return nil, fmt.Errorf("parse QuoterV2 ABI: %w", err)
 	}
-	return &Client{eth: ethclient.NewClient(rpcClient), abi: parsed, quoter: QuoterV2Address}, nil
+	return &Client{eth: ethclient.NewClient(rpcClient), abi: parsed, quoter: quoter}, nil
 }
 
 // Close releases the underlying RPC connection.

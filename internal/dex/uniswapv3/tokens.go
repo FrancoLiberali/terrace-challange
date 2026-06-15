@@ -43,16 +43,3 @@ type Pool struct {
 	Quote Token
 	Fee   uint32
 }
-
-// Uniswap V3 fee tiers in millionths of a unit (the contract's encoding).
-// 3000 = 3000/1_000_000 = 0.3%.
-const feeTier03Percent uint32 = 3000
-
-// PoolETHUSDC03 targets the 0.3% fee-tier ETH-USDC pool — the one the
-// challenge implies and that limitations.md §9 documents as a deliberate
-// single-pool simplification.
-var PoolETHUSDC03 = Pool{
-	Base:  WETH,
-	Quote: USDC,
-	Fee:   feeTier03Percent,
-}

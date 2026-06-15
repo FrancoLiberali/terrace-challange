@@ -71,6 +71,12 @@ linters:
       # entirely, so a string used 1× in production + N× in tests
       # doesn't surface as a goconst issue against the production file.
       ignore-tests: true
+    tagliatelle:
+      # YAML convention is snake_case (rate_limit_rps), not the camel
+      # case tagliatelle defaults to.
+      case:
+        rules:
+          yaml: snake
     govet:
       enable-all: true
       disable:

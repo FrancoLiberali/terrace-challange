@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/joho/godotenv"
 
@@ -44,7 +45,7 @@ func run() error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	sub := chain.NewSubscriber(wsURL)
+	sub := chain.NewSubscriber(wsURL, 1*time.Second, 30*time.Second)
 
 	runErr := make(chan error, 1)
 	go func() { runErr <- sub.Run(ctx) }()
