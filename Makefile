@@ -1,5 +1,7 @@
 .DEFAULT_GOAL := help
-.PHONY: help test lint run build tidy probe-binance probe-uniswap probe-chain
+.PHONY: help test lint run build tidy probe-binance probe-uniswap probe-chain docker-build docker-run
+
+DOCKER_IMAGE := terrace-challenge
 
 help: ## Show this help.
 	@awk 'BEGIN {FS = ":.*##"} /^[a-zA-Z_-]+:.*?##/ { printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
@@ -28,3 +30,9 @@ probe-chain: ## Subscribe to Ethereum newHeads and print incoming blocks.
 
 tidy: ## Run go mod tidy.
 	go mod tidy
+
+docker-build: ## Build the arbd Docker image (no Go required to run).
+	docker build -t $(DOCKER_IMAGE) .
+
+docker-run: ## Run arbd in Docker, reading credentials from ./.env.
+	docker run --rm --env-file .env $(DOCKER_IMAGE)
