@@ -110,12 +110,12 @@ One stack per external host. Binance and the Uniswap RPC provider each get their
 
 ### Why HTTP-transport layer, not the Snapshotter
 
-An earlier iteration of this implementation wrapped Snapshotters with `RateLimited(Snapshotter)` + `CircuitBroken(Snapshotter)` decorators. Two problems with that shape:
+A Snapshotter-level shape was considered — wrapping each `pipeline.Snapshotter` with `RateLimited` + `CircuitBroken` decorators that implement the same interface as the inner one. Two problems ruled it out:
 
-- **Rate limit was misaligned with the venue's actual quota.** A Snapshotter wraps a logical "fetch quotes for these sizes" operation, which fires multiple HTTP calls underneath. With retries inside the raw client, one Snapshot that retried 4 times still consumed only 1 rate token — so the effective HTTP rate during failure bursts could be up to 5× the nominal budget.
-- **Breaker granularity was wrong for partial results.** A Snapshotter that internally fetches from multiple endpoints (multi-pool DEX queries, multi-RPC failover, multi-CEX aggregation in a future extension) should be able to return partial results when only some endpoints are sick. A Snapshot-level breaker would fail the whole Snapshot on one bad endpoint.
+- **Rate limit would be misaligned with the venue's actual quota.** A Snapshotter wraps a logical "fetch quotes for these sizes" operation, which fires multiple HTTP calls underneath. With retries inside the raw client, one Snapshot that retried 4 times would consume only 1 rate token — so the effective HTTP rate during failure bursts could reach 5× the nominal budget.
+- **Breaker granularity would be wrong for partial results.** A Snapshotter that internally fetches from multiple endpoints (multi-pool DEX queries, multi-RPC failover, multi-CEX aggregation in a future extension) should be able to return partial results when only some endpoints are sick. A Snapshot-level breaker would fail the whole Snapshot on one bad endpoint.
 
-Moving the resilience layers to per-host HTTP transport fixes both: each HTTP call is exactly one rate token, and each external dependency has its own breaker.
+Per-host HTTP transport avoids both: each HTTP call is exactly one rate token, and each external dependency has its own breaker.
 
 ### Stacking rationale
 
@@ -130,31 +130,9 @@ Moving the resilience layers to per-host HTTP transport fixes both: each HTTP ca
 - `IsSuccessful` skips `context.Canceled` (caller decision, e.g., SIGTERM mid-call — nothing about the dependency went wrong) but counts `context.DeadlineExceeded` (provider didn't respond within our configured timeout — that IS a health signal).
 - `CheckRetry` recognises `gobreaker.ErrOpenState` and returns `(false, err)` immediately, propagating the breaker error upstream without further attempts.
 
-### Code shape
+### Wiring
 
-```go
-// Per-host: build one *http.Client with the four layers composed.
-binanceHTTP := resilience.NewHTTPClient(resilience.HTTPClientConfig{
-    Retry:          resilience.DefaultRetryConfig(),
-    Limiter:        resilience.NewRateLimiter("binance", 5, 2),
-    Breaker:        resilience.NewCircuitBreaker(resilience.BreakerConfig{
-        Name:         "binance",
-        MinRequests:  20,
-        FailureRatio: 0.2,
-        Cooldown:     30 * time.Second,
-        Interval:     time.Minute,
-        OnStateChange: breakerStateLog, // hook to slog
-    }),
-    RequestTimeout: 10 * time.Second,
-    Logger:         slog.Default(),
-})
-binanceClient := binance.NewClientWithHTTP(binance.DefaultBaseURL, binanceHTTP)
-
-// Uniswap mirrors the shape. The DEX client routes eth_calls through
-// the resilience-equipped *http.Client via
-//   rpc.DialOptions(ctx, url, rpc.WithHTTPClient(c)) + ethclient.NewClient(rpc)
-// so every JSON-RPC request inherits the four-layer stack.
-```
+`resilience.NewHTTPClient` is constructed once per external host in `cmd/arbd/main.go`, with per-venue rate / breaker / retry parameters. The resulting `*http.Client` is passed into `binance.NewClientWithHTTP` and into Uniswap via `rpc.DialOptions(ctx, url, rpc.WithHTTPClient(c))` + `ethclient.NewClient(rpc)`, so every JSON-RPC eth_call inherits the four-layer stack.
 
 The Snapshotter implementations (`pipeline.BinanceSnapshotter`, `pipeline.UniswapSnapshotter`) are unaware of the resilience layers — they just call the raw client whose HTTP transport carries them.
 
