@@ -119,29 +119,29 @@ func run() error {
 	// each stage running in its own goroutine. The main goroutine
 	// consumes candidates and applies the cost model inline.
 	sub := chain.NewSubscriber(cfg.wsURL)
-
-	breakerStateLog := func(venue string, from, to string) {
-		slog.Warn("circuit breaker state change", "venue", venue, "from", from, "to", to)
-	}
-
-	binanceHTTP := resilience.NewRetryingHTTPClient(resilience.DefaultRetryConfig(), 10*time.Second, slog.Default())
+	binanceHTTP := resilience.NewHTTPClient(resilience.HTTPClientConfig{
+		Retry:          resilience.DefaultRetryConfig(),
+		Limiter:        resilience.NewRateLimiter(venueBinance, 5, 2),
+		Breaker:        newBreaker(venueBinance),
+		RequestTimeout: 10 * time.Second,
+		Logger:         slog.Default(),
+	})
 	binanceClient := binance.NewClientWithHTTP(binance.DefaultBaseURL, binanceHTTP)
-	var binanceSn pipeline.Snapshotter = pipeline.NewBinanceSnapshotter(binanceClient, binance.SymbolETHUSDC, tradeSizes)
-	binanceSn = pipeline.CircuitBroken(binanceSn, resilience.NewCircuitBreaker(resilience.BreakerConfig{
-		Name: venueBinance, ConsecutiveFails: 5, Cooldown: 30 * time.Second, OnStateChange: breakerStateLog,
-	}))
-	binanceSn = pipeline.RateLimited(binanceSn, resilience.NewRateLimiter(5, 2))
+	binanceSn := pipeline.NewBinanceSnapshotter(binanceClient, binance.SymbolETHUSDC, tradeSizes)
 
-	uniswapClient, err := uniswapv3.NewClientWithRetry(cfg.httpURL, resilience.DefaultRetryConfig())
+	uniswapHTTP := resilience.NewHTTPClient(resilience.HTTPClientConfig{
+		Retry:          resilience.DefaultRetryConfig(),
+		Limiter:        resilience.NewRateLimiter(venueUniswap, 10, 10),
+		Breaker:        newBreaker(venueUniswap),
+		RequestTimeout: 10 * time.Second,
+		Logger:         slog.Default(),
+	})
+	uniswapClient, err := uniswapv3.NewClientWithHTTP(cfg.httpURL, uniswapHTTP)
 	if err != nil {
 		return fmt.Errorf("connect to RPC: %w", err)
 	}
 	defer uniswapClient.Close()
-	var uniswapSn pipeline.Snapshotter = pipeline.NewUniswapSnapshotter(uniswapClient, uniswapv3.PoolETHUSDC03, tradeSizes)
-	uniswapSn = pipeline.CircuitBroken(uniswapSn, resilience.NewCircuitBreaker(resilience.BreakerConfig{
-		Name: venueUniswap, ConsecutiveFails: 5, Cooldown: 30 * time.Second, OnStateChange: breakerStateLog,
-	}))
-	uniswapSn = pipeline.RateLimited(uniswapSn, resilience.NewRateLimiter(10, 10))
+	uniswapSn := pipeline.NewUniswapSnapshotter(uniswapClient, uniswapv3.PoolETHUSDC03, tradeSizes)
 
 	disp := pipeline.NewDispatcher(map[string]pipeline.Snapshotter{
 		venueBinance: binanceSn,
@@ -174,6 +174,17 @@ func run() error {
 	consume(os.Stdout, pf.Candidates(), ev, cfg.pretty, alertLogger)
 
 	return awaitShutdown(subErr, dispErr, pfErr)
+}
+
+func newBreaker(venue string) *resilience.CircuitBreaker {
+	return resilience.NewCircuitBreaker(resilience.BreakerConfig{
+		Name:             venue,
+		ConsecutiveFails: 5,
+		Cooldown:         30 * time.Second,
+		OnStateChange: func(name, from, to string) {
+			slog.Warn("circuit breaker state change", "venue", name, "from", from, "to", to)
+		},
+	})
 }
 
 func consume(w io.Writer, candidates <-chan pathfinder.CandidatePath, ev *arbitrage.Evaluator, pretty bool, alertLogger *slog.Logger) {

@@ -3,8 +3,11 @@ package resilience
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"time"
 
+	// Classic 3-state circuit breaker from Sony; minimal API, zero
+	// transitive deps.
 	"github.com/sony/gobreaker/v2"
 )
 
@@ -33,12 +36,21 @@ type BreakerConfig struct {
 // NewCircuitBreaker returns a breaker that opens after `cfg.ConsecutiveFails`
 // consecutive failures and cools down for `cfg.Cooldown` before
 // half-open. OnStateChange, if set, is invoked on every transition.
+//
+// context.Canceled is treated as not-a-failure (the caller decided to
+// stop, e.g., SIGTERM mid-call — nothing about the dependency went
+// wrong). context.DeadlineExceeded IS counted as a failure: a provider
+// that doesn't respond within our configured timeout is unhealthy from
+// our point of view, which is exactly what the breaker exists to track.
 func NewCircuitBreaker(cfg BreakerConfig) *CircuitBreaker {
 	settings := gobreaker.Settings{
 		Name:    cfg.Name,
 		Timeout: cfg.Cooldown,
 		ReadyToTrip: func(c gobreaker.Counts) bool {
 			return c.ConsecutiveFailures >= cfg.ConsecutiveFails
+		},
+		IsSuccessful: func(err error) bool {
+			return err == nil || errors.Is(err, context.Canceled)
 		},
 	}
 	if cfg.OnStateChange != nil {
@@ -56,18 +68,22 @@ func NewCircuitBreaker(cfg BreakerConfig) *CircuitBreaker {
 var ErrOpen = gobreaker.ErrOpenState
 
 // Execute runs op through the breaker. If the breaker is open the
-// call is rejected immediately with ErrOpen (or
-// gobreaker.ErrTooManyRequests in the half-open over-probe case) and
-// op is never invoked. Otherwise op runs and its outcome is reported
-// to the breaker.
-func (b *CircuitBreaker) Execute(_ context.Context, op func() error) error {
+// call is rejected immediately with ErrOpen and op is never invoked;
+// the rejection is logged at DEBUG so an operator can see how many
+// calls were short-circuited during an outage (state transitions
+// themselves go through OnStateChange in the config). Otherwise op
+// runs and its outcome is reported to the breaker.
+func (b *CircuitBreaker) Execute(ctx context.Context, op func() error) error {
 	_, err := b.inner.Execute(func() (any, error) {
 		return nil, op()
 	})
 	// Normalise the half-open over-probe rejection to ErrOpen so
 	// callers only need to check one sentinel.
 	if errors.Is(err, gobreaker.ErrTooManyRequests) {
-		return ErrOpen
+		err = ErrOpen
+	}
+	if errors.Is(err, ErrOpen) {
+		slog.DebugContext(ctx, "circuit breaker rejected call", "venue", b.inner.Name())
 	}
 	return err
 }

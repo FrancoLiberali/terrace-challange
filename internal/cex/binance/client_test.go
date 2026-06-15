@@ -193,12 +193,14 @@ func TestClient_NewClientWithHTTP_RetriesTransient5xx(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cfg := resilience.RetryConfig{
-		MaxRetries:  3,
-		InitialWait: 5 * time.Millisecond,
-		MaxWait:     20 * time.Millisecond,
-	}
-	httpClient := resilience.NewRetryingHTTPClient(cfg, 2*time.Second, nil)
+	httpClient := resilience.NewHTTPClient(resilience.HTTPClientConfig{
+		Retry: resilience.RetryConfig{
+			MaxRetries:  3,
+			InitialWait: 5 * time.Millisecond,
+			MaxWait:     20 * time.Millisecond,
+		},
+		RequestTimeout: 2 * time.Second,
+	})
 	client := NewClientWithHTTP(srv.URL, httpClient)
 
 	quotes, err := client.EffectivePrices(context.Background(), SymbolETHUSDC, []decimal.Decimal{dec("1")})

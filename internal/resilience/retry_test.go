@@ -1,18 +1,19 @@
 package resilience
 
 import (
-	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/sony/gobreaker/v2"
 )
 
-// fastRetryConfig is the standard test config: still exponential and
-// jittered (so we exercise the real backoff math) but with sub-second
-// intervals so the tests finish quickly.
+// fastRetryConfig: exponential and jittered (real backoff math)
+// but sub-second so the suite runs quickly.
 func fastRetryConfig() RetryConfig {
 	return RetryConfig{
 		MaxRetries:  3,
@@ -21,93 +22,10 @@ func fastRetryConfig() RetryConfig {
 	}
 }
 
-func TestRetry_SucceedsOnFirstAttempt(t *testing.T) {
-	var calls atomic.Int32
-	err := Retry(t.Context(), func() error {
-		calls.Add(1)
-		return nil
-	}, fastRetryConfig())
-	if err != nil {
-		t.Fatalf("Retry: %v", err)
-	}
-	if got := calls.Load(); got != 1 {
-		t.Errorf("expected 1 call, got %d", got)
-	}
-}
-
-func TestRetry_RetriesTransientUntilSuccess(t *testing.T) {
-	var calls atomic.Int32
-	transient := errors.New("transient")
-	err := Retry(t.Context(), func() error {
-		n := calls.Add(1)
-		if n < 3 {
-			return transient
-		}
-		return nil
-	}, fastRetryConfig())
-	if err != nil {
-		t.Fatalf("Retry: %v", err)
-	}
-	if got := calls.Load(); got != 3 {
-		t.Errorf("expected 3 calls, got %d", got)
-	}
-}
-
-func TestRetry_StopsOnPermanent(t *testing.T) {
-	var calls atomic.Int32
-	deterministic := errors.New("deterministic")
-	err := Retry(t.Context(), func() error {
-		calls.Add(1)
-		return Permanent(deterministic)
-	}, fastRetryConfig())
-	if !errors.Is(err, deterministic) {
-		t.Errorf("expected deterministic error to surface, got %v", err)
-	}
-	if got := calls.Load(); got != 1 {
-		t.Errorf("Permanent should fire exactly once, got %d", got)
-	}
-}
-
-func TestRetry_GivesUpAfterMaxRetries(t *testing.T) {
-	var calls atomic.Int32
-	transient := errors.New("transient")
-	err := Retry(t.Context(), func() error {
-		calls.Add(1)
-		return transient
-	}, fastRetryConfig())
-	if !errors.Is(err, transient) {
-		t.Errorf("expected transient surfaced as final, got %v", err)
-	}
-	// MaxRetries=3 means up to 4 total attempts.
-	if got := calls.Load(); got != 4 {
-		t.Errorf("expected 4 attempts (1 + 3 retries), got %d", got)
-	}
-}
-
-func TestRetry_HonorsContextCancel(t *testing.T) {
-	cfg := RetryConfig{
-		MaxRetries:  10,
-		InitialWait: time.Second, // long enough that ctx cancel wins
-		MaxWait:     time.Second,
-	}
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
-
-	var calls atomic.Int32
-	err := Retry(ctx, func() error {
-		calls.Add(1)
-		return errors.New("transient")
-	}, cfg)
-	if !errors.Is(err, context.Canceled) {
-		t.Errorf("expected context.Canceled, got %v", err)
-	}
-}
-
-func TestRetryingHTTPClient_RetriesOn5xx(t *testing.T) {
+func TestNewHTTPClient_RetriesOn5xx(t *testing.T) {
 	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		n := calls.Add(1)
-		if n < 3 {
+		if calls.Add(1) < 3 {
 			http.Error(w, "boom", http.StatusInternalServerError)
 			return
 		}
@@ -115,7 +33,7 @@ func TestRetryingHTTPClient_RetriesOn5xx(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewRetryingHTTPClient(fastRetryConfig(), 5*time.Second, nil)
+	c := NewHTTPClient(HTTPClientConfig{Retry: fastRetryConfig(), RequestTimeout: 5 * time.Second})
 	resp, err := c.Get(srv.URL)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
@@ -129,7 +47,7 @@ func TestRetryingHTTPClient_RetriesOn5xx(t *testing.T) {
 	}
 }
 
-func TestRetryingHTTPClient_DoesNotRetryOn4xx(t *testing.T) {
+func TestNewHTTPClient_DoesNotRetryOn4xx(t *testing.T) {
 	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		calls.Add(1)
@@ -137,7 +55,7 @@ func TestRetryingHTTPClient_DoesNotRetryOn4xx(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewRetryingHTTPClient(fastRetryConfig(), 5*time.Second, nil)
+	c := NewHTTPClient(HTTPClientConfig{Retry: fastRetryConfig(), RequestTimeout: 5 * time.Second})
 	resp, err := c.Get(srv.URL)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
@@ -148,5 +66,100 @@ func TestRetryingHTTPClient_DoesNotRetryOn4xx(t *testing.T) {
 	}
 	if got := calls.Load(); got != 1 {
 		t.Errorf("expected exactly 1 attempt on 4xx, got %d", got)
+	}
+}
+
+func TestNewHTTPClient_RateLimitGatesRequests(t *testing.T) {
+	// 10 RPS, burst 1 → second request waits ~100ms. Verify the
+	// rate-limit transport actually gated by measuring elapsed time.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := NewHTTPClient(HTTPClientConfig{
+		Retry:          fastRetryConfig(),
+		Limiter:        NewRateLimiter("test", 10, 1),
+		RequestTimeout: 5 * time.Second,
+	})
+	resp1, err := c.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("first get: %v", err)
+	}
+	_ = resp1.Body.Close()
+
+	start := time.Now()
+	resp2, err := c.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("second get: %v", err)
+	}
+	_ = resp2.Body.Close()
+	if d := time.Since(start); d < 50*time.Millisecond {
+		t.Errorf("second request should have been rate-limited (~100ms), waited %v", d)
+	}
+}
+
+func TestNewHTTPClient_OpenBreakerShortCircuitsWithoutRetry(t *testing.T) {
+	// Pre-trip the breaker by feeding it three failures, then verify
+	// that the next HTTP call short-circuits with ErrOpen and does NOT
+	// burn the retry budget on a known-open breaker. Server should see
+	// only the trip-priming calls.
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	breaker := NewCircuitBreaker(BreakerConfig{
+		Name:             "test",
+		ConsecutiveFails: 2,
+		Cooldown:         time.Hour, // stays open for the duration of the test
+	})
+	c := NewHTTPClient(HTTPClientConfig{
+		// Retry off so each Get is one attempt — easier to count toward
+		// the breaker's trip threshold deterministically.
+		Retry:          RetryConfig{},
+		Breaker:        breaker,
+		RequestTimeout: 5 * time.Second,
+	})
+
+	// Two 500s trip the breaker.
+	for range 2 {
+		resp, _ := c.Get(srv.URL)
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+	}
+	primingCalls := calls.Load()
+	if primingCalls != 2 {
+		t.Fatalf("expected 2 priming calls, got %d", primingCalls)
+	}
+
+	// Re-enable retries and try once more — the breaker is open so the
+	// retry loop must short-circuit immediately without hitting the
+	// server again.
+	c = NewHTTPClient(HTTPClientConfig{
+		Retry:          fastRetryConfig(),
+		Breaker:        breaker,
+		RequestTimeout: 5 * time.Second,
+	})
+	resp, err := c.Get(srv.URL)
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	if err == nil {
+		t.Fatal("expected error when breaker is open")
+	}
+	if calls.Load() != primingCalls {
+		t.Errorf("server should not have been hit after breaker opened; got %d additional calls",
+			calls.Load()-primingCalls)
+	}
+	if errors.Is(err, gobreaker.ErrOpenState) {
+		// Good — surfaced unchanged through retryablehttp.
+		return
+	}
+	if !strings.Contains(err.Error(), "circuit breaker is open") {
+		t.Errorf("expected ErrOpenState (or wrapped) in error chain, got %v", err)
 	}
 }

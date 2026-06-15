@@ -2,12 +2,16 @@ package resilience
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"time"
 
-	"github.com/cenkalti/backoff/v5"
+	// Purpose-built HTTP retry transport: Retry-After honoring, body
+	// rewinding, idempotency rules. Drives the retry loop inside the
+	// per-host http.Client.
 	"github.com/hashicorp/go-retryablehttp"
+	"github.com/sony/gobreaker/v2"
 )
 
 // RetryConfig parameterises both the HTTP transport retrier and the
@@ -42,53 +46,103 @@ func DefaultRetryConfig() RetryConfig {
 	}
 }
 
-// NewRetryingHTTPClient returns an *http.Client whose transport
-// retries transient HTTP failures (connection errors, 5xx responses,
-// 408 / 429) with exponential backoff and jitter. The Retry-After
-// response header is honored automatically.
-//
-// `timeout` is applied to each underlying attempt, not to the total
-// retry budget — a single hung connection cannot consume the whole
-// retry window.
-//
-// `logger` may be nil. When non-nil it receives retry-decision
-// messages at debug level.
-func NewRetryingHTTPClient(cfg RetryConfig, timeout time.Duration, logger *slog.Logger) *http.Client {
+// HTTPClientConfig parameterises NewHTTPClient. Limiter and Breaker
+// are optional — pass nil to skip that layer. RequestTimeout applies
+// to each individual attempt, not the total retry budget; a single
+// hung connection cannot consume the entire window.
+type HTTPClientConfig struct {
+	Retry          RetryConfig
+	Limiter        *RateLimiter
+	Breaker        *CircuitBreaker
+	RequestTimeout time.Duration
+	Logger         *slog.Logger
+}
+
+// NewHTTPClient returns an *http.Client whose transport composes the
+// resilience stack for a single external host: retry → circuit
+// breaker → rate limit → real HTTP. The breaker short-circuits
+// before a rate token is consumed, the rate limit gates real network
+// I/O, and retry sits outermost so each attempt sees the freshest
+// state of the underlying layers. ErrOpen surfaces from the breaker
+// as a permanent error to the retry layer — the retry loop does not
+// burn budget on a known-open breaker.
+func NewHTTPClient(cfg HTTPClientConfig) *http.Client {
+	var transport http.RoundTripper
+	transport = http.DefaultTransport
+	if cfg.Limiter != nil {
+		transport = &rateLimitTransport{inner: transport, limiter: cfg.Limiter}
+	}
+	if cfg.Breaker != nil {
+		transport = &circuitBreakerTransport{inner: transport, breaker: cfg.Breaker}
+	}
+
 	c := retryablehttp.NewClient()
-	c.RetryMax = cfg.MaxRetries
-	c.RetryWaitMin = cfg.InitialWait
-	c.RetryWaitMax = cfg.MaxWait
-	c.HTTPClient.Timeout = timeout
-	c.Logger = slogLeveledLogger{logger: logger}
+	c.HTTPClient = &http.Client{Transport: transport, Timeout: cfg.RequestTimeout}
+	c.RetryMax = cfg.Retry.MaxRetries
+	c.RetryWaitMin = cfg.Retry.InitialWait
+	c.RetryWaitMax = cfg.Retry.MaxWait
+	c.Logger = slogLeveledLogger{logger: cfg.Logger}
+	// Don't retry once the breaker has opened — the inner transport
+	// will fail-fast with ErrOpen until the cooldown elapses, so
+	// retries are wasted budget.
+	c.CheckRetry = func(ctx context.Context, resp *http.Response, err error) (bool, error) {
+		if errors.Is(err, gobreaker.ErrOpenState) || errors.Is(err, gobreaker.ErrTooManyRequests) {
+			return false, err
+		}
+		return retryablehttp.DefaultRetryPolicy(ctx, resp, err)
+	}
 	return c.StandardClient()
 }
 
-// Retry runs op with exponential backoff and jitter, honoring ctx
-// cancellation. To stop retrying on a specific error, return
-// backoff.Permanent(err) from op — backoff/v5 unwraps it and surfaces
-// the inner error to the caller.
-func Retry(ctx context.Context, op func() error, cfg RetryConfig) error {
-	b := backoff.NewExponentialBackOff()
-	b.InitialInterval = cfg.InitialWait
-	b.MaxInterval = cfg.MaxWait
-	// RandomizationFactor stays at the default 0.5 (±50% jitter).
-
-	tries := max(cfg.MaxRetries+1, 1)
-	_, err := backoff.Retry(
-		ctx,
-		func() (struct{}, error) { return struct{}{}, op() },
-		backoff.WithBackOff(b),
-		backoff.WithMaxTries(uint(tries)),
-	)
-	return err
+// rateLimitTransport gates each outbound request through the limiter
+// before delegating to the inner transport.
+type rateLimitTransport struct {
+	inner   http.RoundTripper
+	limiter *RateLimiter
 }
 
-// Permanent wraps err so Retry stops retrying and surfaces err
-// directly. Use it for deterministic failures (contract reverts,
-// 4xx responses other than 408/429, malformed input) where another
-// attempt cannot change the outcome.
-func Permanent(err error) error {
-	return backoff.Permanent(err)
+func (t *rateLimitTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if err := t.limiter.Wait(req.Context()); err != nil {
+		return nil, err
+	}
+	return t.inner.RoundTrip(req)
+}
+
+// circuitBreakerTransport gates each outbound request through the
+// breaker. When the breaker is open the request short-circuits with
+// gobreaker.ErrOpenState (which surfaces unchanged to the retry
+// layer so it can be classified as permanent).
+//
+// 5xx responses are reported to the breaker as failures even though
+// Go's HTTP semantics surface them as (resp, nil). Without this, a
+// server consistently returning 500 would never trip the breaker. The
+// 5xx marker error is swallowed on the way out so the response itself
+// still flows upstream — retryablehttp's CheckRetry will see the 5xx
+// status and decide whether to retry.
+type circuitBreakerTransport struct {
+	inner   http.RoundTripper
+	breaker *CircuitBreaker
+}
+
+var errServerError = errors.New("server returned 5xx")
+
+func (t *circuitBreakerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	var resp *http.Response
+	err := t.breaker.Execute(req.Context(), func() error {
+		r, e := t.inner.RoundTrip(req) //nolint:bodyclose // transport passes the body upstream; caller owns Close
+		resp = r
+		if e != nil {
+			return e
+		}
+		if r != nil && r.StatusCode >= http.StatusInternalServerError {
+			return errServerError
+		}
+		return nil
+	})
+	if errors.Is(err, errServerError) {
+		return resp, nil
+	}
+	return resp, err
 }
 
 // slogLeveledLogger adapts an *slog.Logger to retryablehttp's

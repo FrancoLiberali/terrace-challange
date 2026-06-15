@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/big"
+	"net/http"
 	"strings"
 	"sync"
 
@@ -11,51 +12,48 @@ import (
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/shopspring/decimal"
 
 	"github.com/FrancoLiberali/terrace-challenge/internal/pricing"
-	"github.com/FrancoLiberali/terrace-challenge/internal/resilience"
 )
 
 // QuoterV2Address is the deployed QuoterV2 contract on Ethereum mainnet.
 var QuoterV2Address = common.HexToAddress("0x61fFE014bA17989E743c5F6cB21bF9697530B21e")
 
 // Client wraps an Ethereum RPC client to issue QuoterV2 simulated-swap
-// calls. Retries on transient JSON-RPC failures are applied per
-// eth_call using the configured retry policy; rate limiting and
-// circuit breaking belong to wrapper layers above this adapter.
+// calls. Resilience concerns (retry, rate limit, circuit breaker) are
+// applied at the underlying *http.Client transport, so this client
+// stays focused on ABI packing and eth_call dispatch.
 type Client struct {
 	eth    *ethclient.Client
 	abi    abi.ABI
 	quoter common.Address
-	retry  resilience.RetryConfig
 }
 
-// NewClient dials the given Ethereum JSON-RPC endpoint and parses the
-// QuoterV2 ABI once for reuse across calls. Each eth_call is issued
-// without retry — suitable for tests and probe binaries; arbd uses
-// NewClientWithRetry to attach a backoff policy.
+// NewClient dials the given Ethereum JSON-RPC endpoint with the default
+// http.Client. Suitable for tests and the probe binary; arbd uses
+// NewClientWithHTTP to inject a transport with retry / breaker /
+// rate-limit layers.
 func NewClient(rpcURL string) (*Client, error) {
-	return NewClientWithRetry(rpcURL, resilience.RetryConfig{})
+	return NewClientWithHTTP(rpcURL, http.DefaultClient)
 }
 
-// NewClientWithRetry is NewClient with a configurable per-eth_call
-// retry policy. Transient JSON-RPC failures (network errors, server
-// 5xx) are retried with exponential backoff and jitter; deterministic
-// failures ("execution reverted" and the like) are surfaced
-// immediately so the per-row Quote.Err captures the actual contract
-// outcome.
-func NewClientWithRetry(rpcURL string, retry resilience.RetryConfig) (*Client, error) {
-	eth, err := ethclient.Dial(rpcURL)
+// NewClientWithHTTP is NewClient with a caller-supplied http.Client.
+// The client's Transport carries whatever resilience layers the caller
+// has composed (see internal/resilience.NewHTTPClient); both the
+// JSON-RPC dial and every subsequent eth_call go through it.
+func NewClientWithHTTP(rpcURL string, httpClient *http.Client) (*Client, error) {
+	rpcClient, err := rpc.DialOptions(context.Background(), rpcURL, rpc.WithHTTPClient(httpClient))
 	if err != nil {
 		return nil, fmt.Errorf("dial RPC: %w", err)
 	}
 	parsed, err := abi.JSON(strings.NewReader(quoterV2ABI))
 	if err != nil {
-		eth.Close()
+		rpcClient.Close()
 		return nil, fmt.Errorf("parse QuoterV2 ABI: %w", err)
 	}
-	return &Client{eth: eth, abi: parsed, quoter: QuoterV2Address, retry: retry}, nil
+	return &Client{eth: ethclient.NewClient(rpcClient), abi: parsed, quoter: QuoterV2Address}, nil
 }
 
 // Close releases the underlying RPC connection.
@@ -172,26 +170,19 @@ func (c *Client) quote(ctx context.Context, side pricing.Side, size decimal.Deci
 	}
 }
 
-// call packs the given method's params, fires an eth_call to QuoterV2 at
-// latest state, and returns the unpacked outputs. Transient JSON-RPC
-// failures are retried per the Client's retry policy; deterministic
-// failures (contract reverts, ABI mismatches) are surfaced after the
-// first attempt.
+// call packs the given method's params, fires an eth_call to QuoterV2
+// at latest state, and returns the unpacked outputs. Retry on
+// transient transport failures lives in the underlying http.Client's
+// transport; JSON-RPC application errors (execution reverted etc.)
+// arrive here verbatim because the transport sees a 200 OK response
+// and does not retry on the body's error field.
 func (c *Client) call(ctx context.Context, method string, params any) ([]any, error) {
 	data, err := c.abi.Pack(method, params)
 	if err != nil {
 		return nil, fmt.Errorf("pack %s: %w", method, err)
 	}
-	var raw []byte
-	op := func() error {
-		var callErr error
-		raw, callErr = c.eth.CallContract(ctx, ethereum.CallMsg{To: &c.quoter, Data: data}, nil)
-		if callErr != nil && isDeterministicCallErr(callErr) {
-			return resilience.Permanent(callErr)
-		}
-		return callErr
-	}
-	if err = resilience.Retry(ctx, op, c.retry); err != nil {
+	raw, err := c.eth.CallContract(ctx, ethereum.CallMsg{To: &c.quoter, Data: data}, nil)
+	if err != nil {
 		return nil, fmt.Errorf("eth_call %s: %w", method, err)
 	}
 	out, err := c.abi.Unpack(method, raw)
@@ -199,35 +190,4 @@ func (c *Client) call(ctx context.Context, method string, params any) ([]any, er
 		return nil, fmt.Errorf("unpack %s: %w", method, err)
 	}
 	return out, nil
-}
-
-// isDeterministicCallErr reports whether err is a contract-side
-// outcome that cannot be remedied by retrying (e.g., the pool reverts
-// because it cannot service the requested size). The classification
-// is string-based because go-ethereum surfaces JSON-RPC errors as
-// plain error values across nodes/clients — there is no portable
-// typed error to assert on.
-func isDeterministicCallErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	for _, marker := range deterministicCallErrMarkers {
-		if strings.Contains(msg, marker) {
-			return true
-		}
-	}
-	return false
-}
-
-// deterministicCallErrMarkers are substrings that, when present in a
-// CallContract error message, identify the failure as a contract-side
-// outcome rather than a transient transport blip. "execution reverted"
-// is the standard EVM revert string; the others cover the canonical
-// deterministic-failure shapes Geth and major providers emit.
-var deterministicCallErrMarkers = []string{
-	"execution reverted",
-	"invalid opcode",
-	"out of gas",
-	"insufficient funds",
 }
