@@ -1,0 +1,62 @@
+# arbd configuration. Credentials (RPC URLs) and runtime mode
+# (LOG_LEVEL, PRETTY_ALERTS) live in .env — this file is for
+# application tunables only.
+
+# Trade sizes (ETH) snapshot per block. Each (size, direction) becomes a
+# candidate path the Pathfinder evaluates against the cost model.
+trade_sizes: ["1", "10", "100"]
+
+# Minimum net profit (USDC, post-fees and gas) to emit an alert.
+threshold_usdc: "1"
+
+binance:
+  # Standard published Binance Spot taker fee for a Regular User
+  # (0.10%). BNB discount = 7.5; VIP tiers go lower. See limitations.md §8.
+  taker_fee_bps: 10
+  # Free tier comfortably absorbs > 5/sec on /api/v3/depth at limit=100.
+  rate_limit_rps: 5
+  rate_limit_burst: 2
+  # Per-attempt timeout. The retry budget can extend past this — the
+  # window applies to each individual HTTP attempt.
+  request_timeout: 10s
+  breaker:
+    # Open after >20% failure ratio across at least 20 requests in the
+    # current closed-state window. interval resets that window every
+    # minute so old failures don't weigh against new traffic forever.
+    min_requests: 20
+    failure_ratio: 0.2
+    cooldown: 30s
+    interval: 1m
+
+uniswap:
+  # Uniswap's pool fee is encoded on-chain; this field is unused for
+  # the DEX side and exists for shape symmetry.
+  taker_fee_bps: 0
+  # Alchemy free tier is 330 CU/sec; QuoterV2 eth_calls are cheap, so
+  # 10/sec leaves headroom for the 6 per-block calls.
+  rate_limit_rps: 10
+  rate_limit_burst: 10
+  request_timeout: 10s
+  breaker:
+    min_requests: 20
+    failure_ratio: 0.2
+    cooldown: 30s
+    interval: 1m
+
+# HTTP transport retry policy applied per host. retryablehttp's default
+# jitter (±50%) is added on top.
+retry:
+  max_retries: 4
+  initial_wait: 500ms
+  max_wait: 10s
+
+# Per-call timeout the Dispatcher gives each Snapshot. The block cadence
+# is ~12s; this cap means a hung venue can't stall the whole pipeline
+# past one block.
+dispatcher:
+  call_timeout: 8s
+
+# WebSocket reconnect backoff between failed dials.
+subscriber:
+  reconnect_initial: 1s
+  reconnect_max: 30s
