@@ -1,5 +1,7 @@
 # terrace-challenge
 
+[![Coverage](https://sonarcloud.io/api/project_badges/measure?project=FrancoLiberali_terrace-challenge&metric=coverage)](https://sonarcloud.io/summary/new_code?id=FrancoLiberali_terrace-challenge)
+
 Real-time CEX–DEX arbitrage detection between Binance and Uniswap V3 for the ETH-USDC pair, sampled on every Ethereum block. Built in Go as part of the Terrace Senior Software Engineer coding challenge.
 
 The bot subscribes to Ethereum's `newHeads` stream, fetches a fee-adjusted Binance orderbook snapshot and a `QuoterV2` simulation from Uniswap V3 in parallel for each block, pairs the results, applies a cost model (trading fees + gas), and emits a structured alert whenever the net profit clears a configurable threshold.

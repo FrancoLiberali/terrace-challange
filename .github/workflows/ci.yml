@@ -19,6 +19,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # SonarCloud's new-code blame view needs full git history.
+          fetch-depth: 0
 
       - uses: actions/setup-go@v5
         with:
@@ -46,4 +49,13 @@ jobs:
           version: v2.12.2
 
       - name: test
-        run: go test ./... -race -count=1
+        # Coverage is measured only for internal/... — cmd/ holds
+        # wiring + diagnostics exercised by live smoke tests, not
+        # unit tests, so including it would skew the metric.
+        run: go test ./... -race -count=1 -coverprofile=coverage.out -covermode=atomic -coverpkg=./internal/...
+
+      - name: SonarCloud scan
+        uses: SonarSource/sonarqube-scan-action@v4
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: https://sonarcloud.io
