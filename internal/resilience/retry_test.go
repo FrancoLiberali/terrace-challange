@@ -112,9 +112,10 @@ func TestNewHTTPClient_OpenBreakerShortCircuitsWithoutRetry(t *testing.T) {
 	defer srv.Close()
 
 	breaker := NewCircuitBreaker(BreakerConfig{
-		Name:             "test",
-		ConsecutiveFails: 2,
-		Cooldown:         time.Hour, // stays open for the duration of the test
+		Name:         "test",
+		MinRequests:  2,
+		FailureRatio: 0.5,
+		Cooldown:     time.Hour, // stays open for the duration of the test
 	})
 	c := NewHTTPClient(HTTPClientConfig{
 		// Retry nil — each Get is one attempt, deterministic toward

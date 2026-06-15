@@ -5,67 +5,78 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/sony/gobreaker/v2"
 )
 
-func newTestBreaker(consecutive uint32, cooldown time.Duration) *CircuitBreaker {
+// newTestBreaker: 2-request minimum, >50% failure ratio. Tight enough
+// to trip on a small number of failures so the suite stays fast.
+func newTestBreaker(cooldown time.Duration) *CircuitBreaker {
 	return NewCircuitBreaker(BreakerConfig{
-		Name:             "test",
-		ConsecutiveFails: consecutive,
-		Cooldown:         cooldown,
+		Name:         "test",
+		MinRequests:  2,
+		FailureRatio: 0.5,
+		Cooldown:     cooldown,
 	})
 }
 
-func TestCircuitBreaker_OpensAfterConsecutiveFails(t *testing.T) {
-	b := newTestBreaker(3, time.Hour) // long cooldown so we don't accidentally half-open
+func TestCircuitBreaker_TripsOnFailureRatio(t *testing.T) {
+	b := newTestBreaker(time.Hour) // long cooldown so we don't accidentally half-open
 	boom := errors.New("boom")
 
-	for i := range 3 {
+	for i := range 2 {
 		if err := b.Execute(t.Context(), func() error { return boom }); !errors.Is(err, boom) {
 			t.Fatalf("call %d: expected boom, got %v", i, err)
 		}
 	}
-	// Breaker should now be open — next call short-circuits without invoking op.
+	// 2/2 failures = 100% > 50% → tripped. Next call short-circuits without invoking op.
 	called := false
 	err := b.Execute(t.Context(), func() error {
 		called = true
 		return nil
 	})
-	if !errors.Is(err, ErrOpen) {
-		t.Errorf("expected ErrOpen after threshold, got %v", err)
+	if !errors.Is(err, gobreaker.ErrOpenState) {
+		t.Errorf("expected ErrOpenState after threshold, got %v", err)
 	}
 	if called {
 		t.Error("op was invoked while breaker was open")
 	}
 }
 
-func TestCircuitBreaker_ConsecutiveResetsOnSuccess(t *testing.T) {
-	b := newTestBreaker(3, time.Hour)
+func TestCircuitBreaker_StaysClosedBelowMinRequests(t *testing.T) {
+	// MinRequests=5, but we only send 4 failures — ratio is 100% but
+	// sample is below the floor, so the breaker must stay closed.
+	b := NewCircuitBreaker(BreakerConfig{
+		Name:         "test",
+		MinRequests:  5,
+		FailureRatio: 0.2,
+		Cooldown:     time.Hour,
+	})
 	boom := errors.New("boom")
 
-	// 2 failures (one short of threshold)…
-	_ = b.Execute(t.Context(), func() error { return boom })
-	_ = b.Execute(t.Context(), func() error { return boom })
-	// …one success resets the consecutive counter.
-	if err := b.Execute(t.Context(), func() error { return nil }); err != nil {
-		t.Fatalf("success call: %v", err)
+	for range 4 {
+		_ = b.Execute(t.Context(), func() error { return boom })
 	}
-	// Two more failures should NOT trip the breaker (consecutive count was reset).
-	_ = b.Execute(t.Context(), func() error { return boom })
-	_ = b.Execute(t.Context(), func() error { return boom })
-	if err := b.Execute(t.Context(), func() error { return nil }); err != nil {
-		t.Errorf("breaker tripped after non-consecutive failures: %v", err)
+	// Next call must reach op — breaker still closed.
+	called := false
+	_ = b.Execute(t.Context(), func() error {
+		called = true
+		return nil
+	})
+	if !called {
+		t.Error("op was not invoked; breaker must stay closed below MinRequests")
 	}
 }
 
 func TestCircuitBreaker_HalfOpenAllowsProbeAfterCooldown(t *testing.T) {
-	b := newTestBreaker(2, 50*time.Millisecond)
+	b := newTestBreaker(50 * time.Millisecond)
 	boom := errors.New("boom")
 
-	// Trip the breaker.
+	// Trip the breaker (2/2 failures, 100% > 50%).
 	_ = b.Execute(t.Context(), func() error { return boom })
 	_ = b.Execute(t.Context(), func() error { return boom })
 
-	// Wait out the cooldown — breaker should transition to half-open.
+	// Wait out the cooldown — breaker transitions to half-open.
 	time.Sleep(100 * time.Millisecond)
 
 	// A successful probe closes the breaker.
@@ -79,30 +90,31 @@ func TestCircuitBreaker_HalfOpenAllowsProbeAfterCooldown(t *testing.T) {
 }
 
 func TestCircuitBreaker_HalfOpenReopensOnFailure(t *testing.T) {
-	b := newTestBreaker(2, 50*time.Millisecond)
+	b := newTestBreaker(50 * time.Millisecond)
 	boom := errors.New("boom")
 
 	_ = b.Execute(t.Context(), func() error { return boom })
 	_ = b.Execute(t.Context(), func() error { return boom })
 	time.Sleep(100 * time.Millisecond)
 
-	// The half-open probe fails — breaker should re-open.
+	// The half-open probe fails — breaker re-opens.
 	if err := b.Execute(t.Context(), func() error { return boom }); !errors.Is(err, boom) {
 		t.Fatalf("probe should surface inner err, got %v", err)
 	}
-	// Next call before cooldown sees ErrOpen.
+	// Next call before cooldown sees ErrOpenState.
 	err := b.Execute(t.Context(), func() error { return nil })
-	if !errors.Is(err, ErrOpen) {
-		t.Errorf("expected ErrOpen after re-open, got %v", err)
+	if !errors.Is(err, gobreaker.ErrOpenState) {
+		t.Errorf("expected ErrOpenState after re-open, got %v", err)
 	}
 }
 
 func TestCircuitBreaker_OnStateChangeFires(t *testing.T) {
 	var got []string
 	b := NewCircuitBreaker(BreakerConfig{
-		Name:             "test",
-		ConsecutiveFails: 1,
-		Cooldown:         50 * time.Millisecond,
+		Name:         "test",
+		MinRequests:  1,
+		FailureRatio: 0.5,
+		Cooldown:     50 * time.Millisecond,
 		OnStateChange: func(_ string, from, to string) {
 			got = append(got, from+"->"+to)
 		},

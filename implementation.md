@@ -138,10 +138,12 @@ binanceHTTP := resilience.NewHTTPClient(resilience.HTTPClientConfig{
     Retry:          resilience.DefaultRetryConfig(),
     Limiter:        resilience.NewRateLimiter("binance", 5, 2),
     Breaker:        resilience.NewCircuitBreaker(resilience.BreakerConfig{
-        Name:             "binance",
-        ConsecutiveFails: 5,
-        Cooldown:         30 * time.Second,
-        OnStateChange:    breakerStateLog, // hook to slog
+        Name:         "binance",
+        MinRequests:  20,
+        FailureRatio: 0.2,
+        Cooldown:     30 * time.Second,
+        Interval:     time.Minute,
+        OnStateChange: breakerStateLog, // hook to slog
     }),
     RequestTimeout: 10 * time.Second,
     Logger:         slog.Default(),

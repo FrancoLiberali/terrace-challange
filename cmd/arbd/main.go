@@ -185,9 +185,11 @@ func newSlogHandler(pretty bool, opts *slog.HandlerOptions) slog.Handler {
 
 func newBreaker(venue string) *resilience.CircuitBreaker {
 	return resilience.NewCircuitBreaker(resilience.BreakerConfig{
-		Name:             venue,
-		ConsecutiveFails: 5,
-		Cooldown:         30 * time.Second,
+		Name:         venue,
+		MinRequests:  20,
+		FailureRatio: 0.2,
+		Cooldown:     30 * time.Second,
+		Interval:     time.Minute,
 		OnStateChange: func(name, from, to string) {
 			slog.Warn("circuit breaker state change", "venue", name, "from", from, "to", to)
 		},
