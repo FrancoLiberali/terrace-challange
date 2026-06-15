@@ -16,6 +16,7 @@ For the conceptual architecture (what components exist, how they relate, the des
 - [Defensive correctness at boundaries](#defensive-correctness-at-boundaries)
 - [Encapsulation: venue specifics stay in the adapter](#encapsulation-venue-specifics-stay-in-the-adapter)
 - [Emergent design in practice](#emergent-design-in-practice)
+- [Senior Engineer Requirements: what we addressed and what we deferred](#senior-engineer-requirements-what-we-addressed-and-what-we-deferred)
 - [Numeric types for financial math](#numeric-types-for-financial-math)
 
 ---
@@ -208,6 +209,69 @@ Types and abstractions are extracted at the moment composition forces them, not 
 - **The resilience layer's reshape in step 6** (covered in [`Why HTTP-transport layer, not the Snapshotter`](#why-http-transport-layer-not-the-snapshotter) above) is the largest example: the Snapshotter-level shape was wired end-to-end before the misalignment with the venue's actual quota and the breaker-vs-partial-results granularity surfaced. The architectural decision ("resilience as middleware") didn't change; the implementation found a sharper expression of it once the trade-offs were concrete.
 
 The pattern: keep the production code as honest as possible about what's actually known. When a wrapper, interface, or named default stops earning its keep — because the call site changed, or a hypothesised second use case didn't materialise — delete it rather than maintain it.
+
+---
+
+## Senior Engineer Requirements: what we addressed and what we deferred
+
+The brief lists six "Senior Engineer Requirements" beyond the core detector ([`CHALLENGE.md`](./CHALLENGE.md#senior-engineer-requirements)). This section walks through how each was handled — including the items where the deliberate choice was to *not* implement them, with the reasoning behind that.
+
+### 1. Caching strategy — deliberately not implemented
+
+The brief asks for a multi-layered cache covering pool state, gas estimates, and orderbook data.
+
+For the current detector, the Ethereum block is the bot's clock, which makes caching structurally unhelpful. Every block triggers a fresh snapshot; Uniswap V3 pool state changes within a block the moment a swap settles; Binance's orderbook is continuously updated; gas prices move per block via EIP-1559. There's no time window in which a cached value would be both fresh enough to use and old enough to be worth caching: any TTL ≤ block time produces no hit rate, any TTL > block time risks acting on stale data.
+
+Where caching starts to make sense is the future graph-based shape described in architecture.md's [multi-feature evolution](./architecture.md#multi-feature-evolution-stateful-market-graph--per-service-derived-state) — at that point caching is worth revisiting. In the current single-consumer / block-clock shape there's nothing useful to cache.
+
+### 2. WebSocket management & connection resiliency — implemented
+
+| Sub-requirement | Status |
+|---|---|
+| Persistent WS to Ethereum node | ✓ `chain.Subscriber` maintains a persistent `newHeads` subscription |
+| Heartbeat / ping mechanism | Delegated to go-ethereum's WS client, which handles WS-protocol ping/pong with the provider; we don't surface an application-level heartbeat |
+| Reconnect with exponential backoff + jitter | ✓ `cenkalti/backoff/v5` driving the dial-retry loop (1s initial, 30s cap, ±50% jitter) |
+| Track last block + resume without gaps | Partial — block numbers are monotonic and consumers can detect gaps from the `BlockEvent.Number` sequence, but missed blocks during an outage are not backfilled. Detection-only system: discussed in [`limitations.md`](./limitations.md) §1 (block-boundary sampling) and §6 (chain reorgs) |
+| Connection cleanup | ✓ `defer sub.Close()` on every reconnect path |
+
+### 3. Concurrency & performance — implemented
+
+| Sub-requirement | Status |
+|---|---|
+| Goroutines + channels used effectively | ✓ The whole pipeline is channels between per-stage `Run` goroutines (see [Streaming pipeline and concurrency model](#streaming-pipeline-and-concurrency-model) above) |
+| Worker pools for API calls | Not used — the workload is one snapshot per venue per block (≤ 6 concurrent `eth_call`s on the DEX side). Ad-hoc goroutines via `sync.WaitGroup.Go` are simpler than a fixed pool at this throughput; a pool would add bookkeeping for no benefit |
+| Backpressure | The Dispatcher's `select { case d.out <- result: case <-ctx.Done(): }` propagates blockage upstream without dropping data; the Pathfinder's freshness filter ensures a slow venue can't poison fresher block evaluations |
+| Avoid race conditions | ✓ `go test -race` mandatory in CI; per-venue result channels are single-writer by construction |
+| Graceful shutdown with ctx cancellation | ✓ One `signal.NotifyContext` flows through every `Run`; every stage closes its output channel on the way out |
+
+### 4. Rate limiting & resiliency — implemented
+
+All four items live in `internal/resilience/`, composed into a single `*http.Client` per external host. The four-layer transport stack and its design rationale are in [Resilience composition pattern](#resilience-composition-pattern) above.
+
+| Sub-requirement | Implementation |
+|---|---|
+| Rate limiting per external API | Token-bucket via `golang.org/x/time/rate`, per-host instance — each HTTP call consumes exactly one token, including retry attempts |
+| Exponential backoff + jitter for retries | `hashicorp/go-retryablehttp` with Retry-After honouring, body rewinding, and ±50% jitter |
+| Circuit breaker | `sony/gobreaker/v2` with failure-ratio policy (`MinRequests=20`, `FailureRatio=0.2`, `Interval=1m`); `IsSuccessful` distinguishes caller cancellation (`Canceled`) from provider slowness (`DeadlineExceeded`) so SIGTERM doesn't cosmetically trip the breaker |
+| Metrics / observability hooks | Structured `slog` throughout with per-venue identifiers; `OnStateChange` emits breaker transitions at WARN; rate-limit waits and breaker rejections log at DEBUG. The brief's *"even if just structured logging"* exit is taken |
+
+### 5. Configuration & extensibility — implemented
+
+| Sub-requirement | Status |
+|---|---|
+| Support multiple trading pairs (design for ETH-USDC, but extensible) | Pair tokens are exported constants (`uniswapv3.WETH`, `uniswapv3.USDC`) consumed from `cmd/arbd`. Adding a second pair is a new constant + a wiring change. The downstream pipeline (Pathfinder, Evaluator) is pair-agnostic — `grep -r 'WETH\|USDC' internal/pathfinder internal/arbitrage` returns zero hits |
+| Configurable trade sizes | ✓ `config.yaml` field `trade_sizes`; loader rejects empty / non-positive values at startup |
+| Pluggable exchange adapters (interface-based) | ✓ `pipeline.Snapshotter` is the unification seam — one method, `Snapshot(ctx, BlockEvent) (Quotes, error)`. Adding `cex/coinbase/` or `dex/sushiswapv3/` is a new package implementing that interface plus a `pipeline.NewXxxSnapshotter` call in `main.go`. Downstream code never branches on venue identity |
+| Configuration via file or environment | ✓ `config.yaml` for behavior (trade sizes, profit threshold, per-venue resilience tuning) + `.env` for environment bindings (URLs, addresses, runtime mode). The split is documented in [`README.md`](./README.md#configuration) |
+
+### 6. Data modelling & architecture — implemented
+
+| Sub-requirement | Status |
+|---|---|
+| Clear separation of concerns | The package layout mirrors the responsibility chart: `internal/chain/` (block subscription), `internal/cex/binance/` + `internal/dex/uniswapv3/` (raw adapters), `internal/pipeline/` (per-block fan-out + Snapshotter interface), `internal/pathfinder/` (correlation), `internal/arbitrage/` (cost model — pure), `internal/alert/` (output formatting), `internal/resilience/` (cross-cutting). `cmd/arbd/` is the only package that knows how the pieces fit together |
+| Well-defined interfaces | One unification seam (`Snapshotter`) plus two configuration seams (`*http.Client` via `resilience.NewHTTPClient`, `BreakerConfig.OnStateChange`). Other components stay concrete — abstracting them would add noise without enabling real flexibility. See [Interface seams in code](#interface-seams-in-code) above |
+| Error types and handling | Per-row `pricing.Quote.Err` (depth exhaustion at a specific size); per-venue `pipeline.VenueResult.Err` (HTTP timeout, RPC error); `backoff.Permanent` to opt out of retry on deterministic outcomes (execution reverted, etc.). Errors flow alongside successes at every layer — partial results survive |
+| Testability | 87.5% statement coverage on `internal/` (cmd/ excluded as wiring; exercised by live smoke tests per phase); race detector in CI; the decoupled package layout means every component is unit-testable in isolation. The pure packages (`pricing/`, `pathfinder/`, `arbitrage/`) are particularly inexpensive to test thoroughly |
 
 ---
 
