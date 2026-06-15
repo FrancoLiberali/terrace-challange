@@ -9,19 +9,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
-	"math/big"
 	"os"
 	"os/signal"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
 	"github.com/joho/godotenv"
 	"github.com/shopspring/decimal"
 
+	"github.com/FrancoLiberali/terrace-challenge/internal/alert"
 	"github.com/FrancoLiberali/terrace-challenge/internal/arbitrage"
 	"github.com/FrancoLiberali/terrace-challenge/internal/cex/binance"
 	"github.com/FrancoLiberali/terrace-challenge/internal/chain"
@@ -108,9 +106,16 @@ func run() error {
 	}
 	slog.SetDefault(slog.New(newSlogHandler(cfg.pretty, &slog.HandlerOptions{Level: cfg.level})))
 
-	// alertLogger emits unconditionally — the alert is the bot's
-	// product, so LOG_LEVEL must not be able to suppress it.
-	alertLogger := slog.New(newSlogHandler(cfg.pretty, nil))
+	// sink: structured slog event for log aggregation + optional
+	// multi-line block to stdout when PRETTY_ALERTS is on. The sink's
+	// logger emits unconditionally (LOG_LEVEL must not be able to
+	// suppress the bot's product); the default slog handler still
+	// honors LOG_LEVEL for everything else.
+	sink := &alert.TextSink{
+		Logger: slog.New(newSlogHandler(cfg.pretty, nil)),
+		Out:    os.Stdout,
+		Pretty: cfg.pretty,
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -171,7 +176,7 @@ func run() error {
 		)
 	}
 
-	consume(os.Stdout, pf.Candidates(), ev, cfg.pretty, alertLogger)
+	consume(pf.Candidates(), ev, sink)
 
 	return awaitShutdown(subErr, dispErr, pfErr)
 }
@@ -196,7 +201,7 @@ func newBreaker(venue string) *resilience.CircuitBreaker {
 	})
 }
 
-func consume(w io.Writer, candidates <-chan pathfinder.CandidatePath, ev *arbitrage.Evaluator, pretty bool, alertLogger *slog.Logger) {
+func consume(candidates <-chan pathfinder.CandidatePath, ev *arbitrage.Evaluator, sink alert.Sink) {
 	total, profitable := 0, 0
 	for path := range candidates {
 		total++
@@ -205,32 +210,9 @@ func consume(w io.Writer, candidates <-chan pathfinder.CandidatePath, ev *arbitr
 			continue
 		}
 		profitable++
-		emitOpportunity(w, op, pretty, alertLogger)
+		sink.Emit(op)
 	}
 	slog.Info("evaluation finished", "total_candidates", total, "profitable", profitable)
-}
-
-func emitOpportunity(w io.Writer, op arbitrage.Opportunity, pretty bool, alertLogger *slog.Logger) {
-	alertLogger.Info("arbitrage opportunity detected",
-		"block", op.Block.Number,
-		"timestamp", op.Block.Timestamp.Format("2006-01-02T15:04:05Z"),
-		"direction", op.BuyVenue+"→"+op.SellVenue,
-		"buy_venue", op.BuyVenue,
-		"sell_venue", op.SellVenue,
-		"size_eth", op.Size.String(),
-		"buy_price_usdc", op.BuyPrice.StringFixed(4),
-		"sell_price_usdc", op.SellPrice.StringFixed(4),
-		"spread_per_unit", op.SpreadPerUnit.StringFixed(4),
-		"gross_profit_usdc", op.GrossProfit.StringFixed(2),
-		"gas_cost_usdc", op.GasCostUSDC.StringFixed(4),
-		"gas_estimate", op.GasEstimate,
-		"net_profit_usdc", op.NetProfit.StringFixed(2),
-		"net_profit_pct", op.NetProfitPct.StringFixed(4),
-		"capital_usdc", op.CapitalUSDC.StringFixed(2),
-	)
-	if pretty {
-		printOpportunity(w, op)
-	}
 }
 
 // awaitShutdown collects each pipeline stage's Run result. ctx-cancel
@@ -247,60 +229,4 @@ func awaitShutdown(subErr, dispErr, pfErr <-chan error) error {
 		return fmt.Errorf("pathfinder: %w", err)
 	}
 	return nil
-}
-
-// printOpportunity formats an arbitrage alert matching the style of the
-// example in CHALLENGE.md (block, timestamp, direction, prices, profit,
-// execution steps).
-func printOpportunity(w io.Writer, op arbitrage.Opportunity) {
-	directionLabel := op.BuyVenue + " → " + op.SellVenue
-	fmt.Fprintln(w, "=== ARBITRAGE OPPORTUNITY DETECTED ===")
-	fmt.Fprintf(w, "Block Number: %d\n", op.Block.Number)
-	fmt.Fprintf(w, "Timestamp:    %s\n", op.Block.Timestamp.Format("2006-01-02 15:04:05 UTC"))
-	fmt.Fprintf(w, "Direction:    %s  (Buy on %s, Sell on %s)\n", directionLabel, op.BuyVenue, op.SellVenue)
-	fmt.Fprintln(w)
-	fmt.Fprintf(w, "Trade Size:        %s ETH\n", op.Size.String())
-	fmt.Fprintf(w, "Buy  Price:        $%s / ETH (effective, slippage-aware) — %s\n", op.BuyPrice.StringFixed(4), op.BuyVenue)
-	fmt.Fprintf(w, "Sell Price:        $%s / ETH (effective, slippage-aware) — %s\n", op.SellPrice.StringFixed(4), op.SellVenue)
-	fmt.Fprintf(w, "Spread per unit:   $%s / ETH (%s%%)\n",
-		op.SpreadPerUnit.StringFixed(4),
-		op.SpreadPerUnit.Div(op.BuyPrice).Mul(decimal.NewFromInt(100)).StringFixed(4))
-	fmt.Fprintln(w)
-	fmt.Fprintf(w, "Profit (post-fee): $%s  (already net of venue-intrinsic fees, gross of gas)\n", op.GrossProfit.StringFixed(2))
-	fmt.Fprintf(w, "Gas Cost (est):    $%s  (baseFee=%s gwei, ~%d gas)\n",
-		op.GasCostUSDC.StringFixed(4),
-		formatGwei(op.Block.BaseFee),
-		op.GasEstimate,
-	)
-	fmt.Fprintf(w, "Net Profit:        $%s  (%s%%)\n",
-		op.NetProfit.StringFixed(2),
-		op.NetProfitPct.StringFixed(4),
-	)
-	fmt.Fprintf(w, "Capital Required:  $%s USDC\n", op.CapitalUSDC.StringFixed(2))
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Execution Steps:")
-	fmt.Fprintf(w, "  1. Buy  %s ETH on %s at ~$%s/ETH (capital: ~$%s)\n",
-		op.Size.String(), op.BuyVenue, op.BuyPrice.StringFixed(2), op.CapitalUSDC.StringFixed(2))
-	fmt.Fprintf(w, "  2. Move ETH to the venue that sells (operationally — bridging, transfer time, etc.)\n")
-	fmt.Fprintf(w, "  3. Sell %s ETH on %s at ~$%s/ETH (expected: ~$%s)\n",
-		op.Size.String(), op.SellVenue, op.SellPrice.StringFixed(2),
-		op.SellPrice.Mul(op.Size).StringFixed(2),
-	)
-	fmt.Fprintln(w, "Risk factors: see limitations.md (intra-block drift, MEV on the DEX leg, gas-price spikes)")
-	fmt.Fprintln(w, strings.Repeat("─", 60))
-}
-
-// formatGwei prints a wei amount as a fixed-point gwei string (3 dp).
-// Duplicated from probe-chain — small enough that a shared helper isn't
-// worth a new package yet.
-func formatGwei(wei *big.Int) string {
-	if wei == nil {
-		return "n/a"
-	}
-	const oneGweiInWei = 1_000_000_000
-	gwei := new(big.Int).Mul(wei, big.NewInt(1000))
-	gwei.Quo(gwei, big.NewInt(oneGweiInWei))
-	whole := new(big.Int).Quo(gwei, big.NewInt(1000))
-	frac := new(big.Int).Mod(gwei, big.NewInt(1000))
-	return fmt.Sprintf("%s.%03d", whole.String(), frac.Int64())
 }
