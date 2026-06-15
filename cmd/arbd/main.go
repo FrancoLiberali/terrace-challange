@@ -187,8 +187,11 @@ func buildBinanceSnapshotter(envCfg envConfig, appCfg config.Config) pipeline.Sn
 }
 
 func buildUniswapSnapshotter(envCfg envConfig, appCfg config.Config) (pipeline.Snapshotter, func(), error) {
-	pool := uniswapv3.PoolETHUSDC03
-	pool.Fee = envCfg.uniswapPoolFee
+	pool := uniswapv3.Pool{
+		Base:  uniswapv3.WETH,
+		Quote: uniswapv3.USDC,
+		Fee:   envCfg.uniswapPoolFee,
+	}
 	httpClient := newHTTPClient(venueUniswap, appCfg.Uniswap, appCfg.Retry)
 	client, err := uniswapv3.NewClientWithHTTP(envCfg.ethRPCURL, envCfg.uniswapQuoter, httpClient)
 	if err != nil {

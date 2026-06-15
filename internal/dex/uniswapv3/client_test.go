@@ -27,6 +27,12 @@ import (
 // work too; the marker address makes intent explicit.
 var testQuoterAddress = common.HexToAddress("0x0000000000000000000000000000000000007e57")
 
+// testPool is the ETH-USDC pool fixture used across happy-path tests.
+// Fee tier is irrelevant to the fake server, which dispatches by
+// function selector, but matching mainnet's 0.3% pool keeps the
+// fixture obvious.
+var testPool = Pool{Base: WETH, Quote: USDC, Fee: 3000}
+
 // newQuoterServer stands up a fake JSON-RPC server that recognizes
 // QuoterV2's two function selectors and replies with the supplied
 // pre-packed output bytes. selectorCounts (optional) is populated with
@@ -148,7 +154,7 @@ func TestEffectivePrices_HappyPath(t *testing.T) {
 	}
 	defer client.Close()
 
-	quotes, err := client.EffectivePrices(context.Background(), PoolETHUSDC03, []decimal.Decimal{dec("1")})
+	quotes, err := client.EffectivePrices(context.Background(), testPool, []decimal.Decimal{dec("1")})
 	if err != nil {
 		t.Fatalf("EffectivePrices: %v", err)
 	}
@@ -210,7 +216,7 @@ func TestEffectivePrices_MultipleSizes_IssuesOneCallPerSizePerSide(t *testing.T)
 	defer client.Close()
 
 	sizes := []decimal.Decimal{dec("1"), dec("10"), dec("100")}
-	quotes, err := client.EffectivePrices(context.Background(), PoolETHUSDC03, sizes)
+	quotes, err := client.EffectivePrices(context.Background(), testPool, sizes)
 	if err != nil {
 		t.Fatalf("EffectivePrices: %v", err)
 	}
@@ -255,7 +261,7 @@ func TestEffectivePrices_EmptySizes(t *testing.T) {
 	}
 	defer client.Close()
 
-	quotes, err := client.EffectivePrices(context.Background(), PoolETHUSDC03, nil)
+	quotes, err := client.EffectivePrices(context.Background(), testPool, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -289,7 +295,7 @@ func TestEffectivePrices_PerRowFailureWhenRPCErrors(t *testing.T) {
 	}
 	defer client.Close()
 
-	quotes, err := client.EffectivePrices(context.Background(), PoolETHUSDC03, []decimal.Decimal{dec("1")})
+	quotes, err := client.EffectivePrices(context.Background(), testPool, []decimal.Decimal{dec("1")})
 	if err != nil {
 		t.Fatalf("top-level error: %v", err)
 	}
@@ -372,7 +378,7 @@ func TestEffectivePrices_TransportRetriesOnTransient5xx(t *testing.T) {
 	}
 	defer client.Close()
 
-	quotes, err := client.EffectivePrices(t.Context(), PoolETHUSDC03, []decimal.Decimal{dec("1")})
+	quotes, err := client.EffectivePrices(t.Context(), testPool, []decimal.Decimal{dec("1")})
 	if err != nil {
 		t.Fatalf("EffectivePrices: %v", err)
 	}

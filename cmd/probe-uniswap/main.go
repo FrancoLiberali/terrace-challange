@@ -12,6 +12,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -52,6 +53,14 @@ func run() error {
 	if !common.IsHexAddress(quoterRaw) {
 		return fmt.Errorf("invalid UNISWAP_QUOTER_ADDRESS %q: not a hex-encoded address", quoterRaw)
 	}
+	feeRaw := os.Getenv("UNISWAP_POOL_FEE")
+	if feeRaw == "" {
+		return errors.New("UNISWAP_POOL_FEE is not set in .env (see README.md)")
+	}
+	fee, err := strconv.ParseUint(feeRaw, 10, 32)
+	if err != nil {
+		return fmt.Errorf("invalid UNISWAP_POOL_FEE %q: %w", feeRaw, err)
+	}
 
 	client, err := uniswapv3.NewClient(rpcURL, common.HexToAddress(quoterRaw))
 	if err != nil {
@@ -62,7 +71,8 @@ func run() error {
 	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
 	defer cancel()
 
-	quotes, err := client.EffectivePrices(ctx, uniswapv3.PoolETHUSDC03, tradeSizes)
+	pool := uniswapv3.Pool{Base: uniswapv3.WETH, Quote: uniswapv3.USDC, Fee: uint32(fee)}
+	quotes, err := client.EffectivePrices(ctx, pool, tradeSizes)
 	if err != nil {
 		return fmt.Errorf("fetch effective prices: %w", err)
 	}
