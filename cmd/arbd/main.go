@@ -10,19 +10,20 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
 	"syscall"
-	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/joho/godotenv"
-	"github.com/shopspring/decimal"
 
 	"github.com/FrancoLiberali/terrace-challenge/internal/alert"
 	"github.com/FrancoLiberali/terrace-challenge/internal/arbitrage"
 	"github.com/FrancoLiberali/terrace-challenge/internal/cex/binance"
 	"github.com/FrancoLiberali/terrace-challenge/internal/chain"
+	"github.com/FrancoLiberali/terrace-challenge/internal/config"
 	"github.com/FrancoLiberali/terrace-challenge/internal/dex/uniswapv3"
 	"github.com/FrancoLiberali/terrace-challenge/internal/pathfinder"
 	"github.com/FrancoLiberali/terrace-challenge/internal/pipeline"
@@ -37,24 +38,9 @@ const (
 	venueUniswap = "uniswap"
 )
 
-// Hardcoded for now; configuration lands in Step 7.
-var (
-	tradeSizes = []decimal.Decimal{
-		decimal.NewFromInt(1),
-		decimal.NewFromInt(10),
-		decimal.NewFromInt(100),
-	}
-
-	// Default cost model. Trading fees are NOT here: each adapter folds
-	// its venue's intrinsic fees into the Price it returns (Binance's
-	// taker fee via binance.Symbol.TakerFeeBps, Uniswap V3's 0.3% pool
-	// fee already in QuoterV2's output). Gas units travel per-candidate
-	// from QuoterV2's per-call gasEstimate. The model just carries the
-	// profitability threshold.
-	defaultCostModel = arbitrage.CostModel{
-		MinNetProfitUSDC: decimal.NewFromInt(1),
-	}
-)
+// defaultConfigPath is where Load looks for the YAML if CONFIG_FILE is
+// not set in the environment.
+const defaultConfigPath = "config.yaml"
 
 func main() {
 	if err := run(); err != nil {
@@ -64,10 +50,13 @@ func main() {
 }
 
 type envConfig struct {
-	httpURL string
-	wsURL   string
-	pretty  bool
-	level   slog.Level
+	ethRPCURL      string
+	wsURL          string
+	binanceBaseURL string
+	uniswapPoolFee uint32
+	uniswapQuoter  common.Address
+	pretty         bool
+	level          slog.Level
 }
 
 func loadEnv() (envConfig, error) {
@@ -75,15 +64,36 @@ func loadEnv() (envConfig, error) {
 		return envConfig{}, fmt.Errorf("load .env: %w", err)
 	}
 	cfg := envConfig{
-		httpURL: os.Getenv("ETH_RPC_URL"),
-		wsURL:   os.Getenv("ETH_RPC_WS_URL"),
+		ethRPCURL:      os.Getenv("ETH_RPC_URL"),
+		wsURL:          os.Getenv("ETH_RPC_WS_URL"),
+		binanceBaseURL: os.Getenv("BINANCE_BASE_URL"),
 	}
-	if cfg.httpURL == "" {
+	if cfg.ethRPCURL == "" {
 		return envConfig{}, errors.New("ETH_RPC_URL is not set in .env (see README.md)")
 	}
 	if cfg.wsURL == "" {
 		return envConfig{}, errors.New("ETH_RPC_WS_URL is not set in .env (see README.md)")
 	}
+	if cfg.binanceBaseURL == "" {
+		return envConfig{}, errors.New("BINANCE_BASE_URL is not set in .env (see README.md)")
+	}
+	feeRaw := os.Getenv("UNISWAP_POOL_FEE")
+	if feeRaw == "" {
+		return envConfig{}, errors.New("UNISWAP_POOL_FEE is not set in .env (see README.md)")
+	}
+	fee, err := strconv.ParseUint(feeRaw, 10, 32)
+	if err != nil {
+		return envConfig{}, fmt.Errorf("invalid UNISWAP_POOL_FEE %q: %w", feeRaw, err)
+	}
+	cfg.uniswapPoolFee = uint32(fee)
+	quoterRaw := os.Getenv("UNISWAP_QUOTER_ADDRESS")
+	if quoterRaw == "" {
+		return envConfig{}, errors.New("UNISWAP_QUOTER_ADDRESS is not set in .env (see README.md)")
+	}
+	if !common.IsHexAddress(quoterRaw) {
+		return envConfig{}, fmt.Errorf("invalid UNISWAP_QUOTER_ADDRESS %q: not a hex-encoded address", quoterRaw)
+	}
+	cfg.uniswapQuoter = common.HexToAddress(quoterRaw)
 	if raw := os.Getenv("LOG_LEVEL"); raw != "" {
 		if err := cfg.level.UnmarshalText([]byte(raw)); err != nil {
 			return envConfig{}, fmt.Errorf("invalid LOG_LEVEL %q: %w", raw, err)
@@ -99,61 +109,48 @@ func loadEnv() (envConfig, error) {
 	return cfg, nil
 }
 
+func configPath() string {
+	if p := os.Getenv("CONFIG_FILE"); p != "" {
+		return p
+	}
+	return defaultConfigPath
+}
+
 func run() error {
-	cfg, err := loadEnv()
+	envCfg, err := loadEnv()
 	if err != nil {
 		return err
 	}
-	slog.SetDefault(slog.New(newSlogHandler(cfg.pretty, &slog.HandlerOptions{Level: cfg.level})))
+	appCfg, err := config.Load(configPath())
+	if err != nil {
+		return err
+	}
+	slog.SetDefault(slog.New(newSlogHandler(envCfg.pretty, &slog.HandlerOptions{Level: envCfg.level})))
 
-	// sink: structured slog event for log aggregation + optional
-	// multi-line block to stdout when PRETTY_ALERTS is on. The sink's
-	// logger emits unconditionally (LOG_LEVEL must not be able to
-	// suppress the bot's product); the default slog handler still
-	// honors LOG_LEVEL for everything else.
 	sink := &alert.TextSink{
-		Logger: slog.New(newSlogHandler(cfg.pretty, nil)),
+		Logger: slog.New(newSlogHandler(envCfg.pretty, nil)),
 		Out:    os.Stdout,
-		Pretty: cfg.pretty,
+		Pretty: envCfg.pretty,
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	// Subscriber → Dispatcher → Pathfinder is a three-stage pipeline,
-	// each stage running in its own goroutine. The main goroutine
-	// consumes candidates and applies the cost model inline.
-	sub := chain.NewSubscriber(cfg.wsURL)
-	binanceHTTP := resilience.NewHTTPClient(resilience.HTTPClientConfig{
-		Retry:          resilience.DefaultRetryConfig(),
-		Limiter:        resilience.NewRateLimiter(venueBinance, 5, 2),
-		Breaker:        newBreaker(venueBinance),
-		RequestTimeout: 10 * time.Second,
-		Logger:         slog.Default(),
-	})
-	binanceClient := binance.NewClientWithHTTP(binance.DefaultBaseURL, binanceHTTP)
-	binanceSn := pipeline.NewBinanceSnapshotter(binanceClient, binance.SymbolETHUSDC, tradeSizes)
+	sub := chain.NewSubscriber(envCfg.wsURL, appCfg.Subscriber.ReconnectInitial, appCfg.Subscriber.ReconnectMax)
 
-	uniswapHTTP := resilience.NewHTTPClient(resilience.HTTPClientConfig{
-		Retry:          resilience.DefaultRetryConfig(),
-		Limiter:        resilience.NewRateLimiter(venueUniswap, 10, 10),
-		Breaker:        newBreaker(venueUniswap),
-		RequestTimeout: 10 * time.Second,
-		Logger:         slog.Default(),
-	})
-	uniswapClient, err := uniswapv3.NewClientWithHTTP(cfg.httpURL, uniswapHTTP)
+	binanceSn := buildBinanceSnapshotter(envCfg, appCfg)
+	uniswapSn, uniswapClose, err := buildUniswapSnapshotter(envCfg, appCfg)
 	if err != nil {
-		return fmt.Errorf("connect to RPC: %w", err)
+		return err
 	}
-	defer uniswapClient.Close()
-	uniswapSn := pipeline.NewUniswapSnapshotter(uniswapClient, uniswapv3.PoolETHUSDC03, tradeSizes)
+	defer uniswapClose()
 
 	disp := pipeline.NewDispatcher(map[string]pipeline.Snapshotter{
 		venueBinance: binanceSn,
 		venueUniswap: uniswapSn,
-	})
+	}, appCfg.Dispatcher.CallTimeout)
 	pf := pathfinder.NewPathfinder()
-	ev := arbitrage.NewEvaluator(defaultCostModel)
+	ev := arbitrage.NewEvaluator(arbitrage.CostModel{MinNetProfitUSDC: appCfg.ThresholdUSDC})
 
 	subErr := make(chan error, 1)
 	go func() { subErr <- sub.Run(ctx) }()
@@ -165,14 +162,14 @@ func run() error {
 	slog.Info("arbd starting",
 		"venues", []string{venueBinance, venueUniswap},
 		"pair", "ETH-USDC",
-		"dex_pool", "uniswap_v3_0.3pct",
-		"threshold_usdc", defaultCostModel.MinNetProfitUSDC.String(),
+		"uniswap_pool_fee", envCfg.uniswapPoolFee,
+		"threshold_usdc", appCfg.ThresholdUSDC.String(),
 	)
-	if cfg.pretty {
+	if envCfg.pretty {
 		fmt.Fprintf(os.Stdout,
-			"arbd: detecting CEX↔DEX arbitrage on ETH-USDC (binance + uniswap v3 0.3%%)\n"+
+			"arbd: detecting CEX↔DEX arbitrage on ETH-USDC (binance + uniswap v3 fee=%d)\n"+
 				"      threshold: net profit > $%s USDC — Ctrl+C to stop\n\n",
-			defaultCostModel.MinNetProfitUSDC.String(),
+			envCfg.uniswapPoolFee, appCfg.ThresholdUSDC.String(),
 		)
 	}
 
@@ -181,24 +178,53 @@ func run() error {
 	return awaitShutdown(subErr, dispErr, pfErr)
 }
 
+func buildBinanceSnapshotter(envCfg envConfig, appCfg config.Config) pipeline.Snapshotter {
+	symbol := binance.SymbolETHUSDC
+	symbol.TakerFeeBps = appCfg.Binance.TakerFeeBps
+	httpClient := newHTTPClient(venueBinance, appCfg.Binance, appCfg.Retry)
+	client := binance.NewClientWithHTTP(envCfg.binanceBaseURL, httpClient)
+	return pipeline.NewBinanceSnapshotter(client, symbol, appCfg.TradeSizes)
+}
+
+func buildUniswapSnapshotter(envCfg envConfig, appCfg config.Config) (pipeline.Snapshotter, func(), error) {
+	pool := uniswapv3.PoolETHUSDC03
+	pool.Fee = envCfg.uniswapPoolFee
+	httpClient := newHTTPClient(venueUniswap, appCfg.Uniswap, appCfg.Retry)
+	client, err := uniswapv3.NewClientWithHTTP(envCfg.ethRPCURL, envCfg.uniswapQuoter, httpClient)
+	if err != nil {
+		return nil, nil, fmt.Errorf("connect to RPC: %w", err)
+	}
+	return pipeline.NewUniswapSnapshotter(client, pool, appCfg.TradeSizes), client.Close, nil
+}
+
+func newHTTPClient(venue string, vCfg config.VenueConfig, retry config.RetryConfig) *http.Client {
+	return resilience.NewHTTPClient(resilience.HTTPClientConfig{
+		Retry: &resilience.RetryConfig{
+			MaxRetries:  retry.MaxRetries,
+			InitialWait: retry.InitialWait,
+			MaxWait:     retry.MaxWait,
+		},
+		Limiter: resilience.NewRateLimiter(venue, vCfg.RateLimitRPS, vCfg.RateLimitBurst),
+		Breaker: resilience.NewCircuitBreaker(resilience.BreakerConfig{
+			Name:         venue,
+			MinRequests:  vCfg.Breaker.MinRequests,
+			FailureRatio: vCfg.Breaker.FailureRatio,
+			Cooldown:     vCfg.Breaker.Cooldown,
+			Interval:     vCfg.Breaker.Interval,
+			OnStateChange: func(name, from, to string) {
+				slog.Warn("circuit breaker state change", "venue", name, "from", from, "to", to)
+			},
+		}),
+		RequestTimeout: vCfg.RequestTimeout,
+		Logger:         slog.Default(),
+	})
+}
+
 func newSlogHandler(pretty bool, opts *slog.HandlerOptions) slog.Handler {
 	if pretty {
 		return slog.NewTextHandler(os.Stderr, opts)
 	}
 	return slog.NewJSONHandler(os.Stderr, opts)
-}
-
-func newBreaker(venue string) *resilience.CircuitBreaker {
-	return resilience.NewCircuitBreaker(resilience.BreakerConfig{
-		Name:         venue,
-		MinRequests:  20,
-		FailureRatio: 0.2,
-		Cooldown:     30 * time.Second,
-		Interval:     time.Minute,
-		OnStateChange: func(name, from, to string) {
-			slog.Warn("circuit breaker state change", "venue", name, "from", from, "to", to)
-		},
-	})
 }
 
 func consume(candidates <-chan pathfinder.CandidatePath, ev *arbitrage.Evaluator, sink alert.Sink) {

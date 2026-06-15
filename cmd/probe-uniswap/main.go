@@ -14,6 +14,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/joho/godotenv"
 	"github.com/shopspring/decimal"
 
@@ -44,8 +45,15 @@ func run() error {
 	if rpcURL == "" {
 		return errors.New("ETH_RPC_URL is not set in .env (see README.md)")
 	}
+	quoterRaw := os.Getenv("UNISWAP_QUOTER_ADDRESS")
+	if quoterRaw == "" {
+		return errors.New("UNISWAP_QUOTER_ADDRESS is not set in .env (see README.md)")
+	}
+	if !common.IsHexAddress(quoterRaw) {
+		return fmt.Errorf("invalid UNISWAP_QUOTER_ADDRESS %q: not a hex-encoded address", quoterRaw)
+	}
 
-	client, err := uniswapv3.NewClient(rpcURL)
+	client, err := uniswapv3.NewClient(rpcURL, common.HexToAddress(quoterRaw))
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}

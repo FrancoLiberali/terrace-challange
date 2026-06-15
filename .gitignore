@@ -30,6 +30,9 @@ go.work.sum
 # make build output
 /bin/
 
+# Challenge brief — already in the repo as CHALLENGE.md.
+challenge.pdf
+
 # Editor/IDE
 # .idea/
 # .vscode/

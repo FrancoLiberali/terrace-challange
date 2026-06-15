@@ -68,19 +68,16 @@ type Subscriber struct {
 	reconnectMaxDelay     time.Duration
 }
 
-const (
-	defaultReconnectInitialDelay = 1 * time.Second
-	defaultReconnectMaxDelay     = 30 * time.Second
-)
-
-// NewSubscriber returns a Subscriber bound to the given WebSocket RPC URL.
-// Call Events() once for the output stream, then Run(ctx) to drive it.
-func NewSubscriber(wsURL string) *Subscriber {
+// NewSubscriber returns a Subscriber bound to the given WebSocket RPC URL,
+// with the supplied exponential-backoff bounds between reconnect
+// attempts. Call Events() once for the output stream, then Run(ctx)
+// to drive it.
+func NewSubscriber(wsURL string, reconnectInitial, reconnectMax time.Duration) *Subscriber {
 	return &Subscriber{
 		dial:                  &ethDialer{url: wsURL},
 		out:                   make(chan BlockEvent),
-		reconnectInitialDelay: defaultReconnectInitialDelay,
-		reconnectMaxDelay:     defaultReconnectMaxDelay,
+		reconnectInitialDelay: reconnectInitial,
+		reconnectMaxDelay:     reconnectMax,
 	}
 }
 

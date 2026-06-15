@@ -15,11 +15,17 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/shopspring/decimal"
 
 	"github.com/FrancoLiberali/terrace-challenge/internal/pricing"
 	"github.com/FrancoLiberali/terrace-challenge/internal/resilience"
 )
+
+// testQuoterAddress is any address — tests dispatch by function
+// selector inside the fake server, not by `to`. The zero value would
+// work too; the marker address makes intent explicit.
+var testQuoterAddress = common.HexToAddress("0x0000000000000000000000000000000000007e57")
 
 // newQuoterServer stands up a fake JSON-RPC server that recognizes
 // QuoterV2's two function selectors and replies with the supplied
@@ -136,7 +142,7 @@ func TestEffectivePrices_HappyPath(t *testing.T) {
 	srv := newQuoterServer(t, sellOut, buyOut, counts)
 	defer srv.Close()
 
-	client, err := NewClient(srv.URL)
+	client, err := NewClient(srv.URL, testQuoterAddress)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -197,7 +203,7 @@ func TestEffectivePrices_MultipleSizes_IssuesOneCallPerSizePerSide(t *testing.T)
 	srv := newQuoterServer(t, sellOut, buyOut, counts)
 	defer srv.Close()
 
-	client, err := NewClient(srv.URL)
+	client, err := NewClient(srv.URL, testQuoterAddress)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -243,7 +249,7 @@ func TestEffectivePrices_EmptySizes(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client, err := NewClient(srv.URL)
+	client, err := NewClient(srv.URL, testQuoterAddress)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -277,7 +283,7 @@ func TestEffectivePrices_PerRowFailureWhenRPCErrors(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client, err := NewClient(srv.URL)
+	client, err := NewClient(srv.URL, testQuoterAddress)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -360,7 +366,7 @@ func TestEffectivePrices_TransportRetriesOnTransient5xx(t *testing.T) {
 		},
 		RequestTimeout: 2 * time.Second,
 	})
-	client, err := NewClientWithHTTP(srv.URL, httpClient)
+	client, err := NewClientWithHTTP(srv.URL, testQuoterAddress, httpClient)
 	if err != nil {
 		t.Fatalf("NewClientWithHTTP: %v", err)
 	}
