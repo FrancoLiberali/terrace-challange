@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/big"
+	"net/http"
 	"strings"
 	"sync"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/shopspring/decimal"
 
 	"github.com/FrancoLiberali/terrace-challenge/internal/pricing"
@@ -20,28 +22,38 @@ import (
 var QuoterV2Address = common.HexToAddress("0x61fFE014bA17989E743c5F6cB21bF9697530B21e")
 
 // Client wraps an Ethereum RPC client to issue QuoterV2 simulated-swap
-// calls. It is intentionally thin: no rate limiting, no retries, no
-// circuit breaking — those concerns belong to wrapper layers above the
-// adapter.
+// calls. Resilience concerns (retry, rate limit, circuit breaker) are
+// applied at the underlying *http.Client transport, so this client
+// stays focused on ABI packing and eth_call dispatch.
 type Client struct {
 	eth    *ethclient.Client
 	abi    abi.ABI
 	quoter common.Address
 }
 
-// NewClient dials the given Ethereum JSON-RPC endpoint and parses the
-// QuoterV2 ABI once for reuse across calls.
+// NewClient dials the given Ethereum JSON-RPC endpoint with the default
+// http.Client. Suitable for tests and the probe binary; arbd uses
+// NewClientWithHTTP to inject a transport with retry / breaker /
+// rate-limit layers.
 func NewClient(rpcURL string) (*Client, error) {
-	eth, err := ethclient.Dial(rpcURL)
+	return NewClientWithHTTP(rpcURL, http.DefaultClient)
+}
+
+// NewClientWithHTTP is NewClient with a caller-supplied http.Client.
+// The client's Transport carries whatever resilience layers the caller
+// has composed (see internal/resilience.NewHTTPClient); both the
+// JSON-RPC dial and every subsequent eth_call go through it.
+func NewClientWithHTTP(rpcURL string, httpClient *http.Client) (*Client, error) {
+	rpcClient, err := rpc.DialOptions(context.Background(), rpcURL, rpc.WithHTTPClient(httpClient))
 	if err != nil {
 		return nil, fmt.Errorf("dial RPC: %w", err)
 	}
 	parsed, err := abi.JSON(strings.NewReader(quoterV2ABI))
 	if err != nil {
-		eth.Close()
+		rpcClient.Close()
 		return nil, fmt.Errorf("parse QuoterV2 ABI: %w", err)
 	}
-	return &Client{eth: eth, abi: parsed, quoter: QuoterV2Address}, nil
+	return &Client{eth: ethclient.NewClient(rpcClient), abi: parsed, quoter: QuoterV2Address}, nil
 }
 
 // Close releases the underlying RPC connection.
@@ -158,8 +170,12 @@ func (c *Client) quote(ctx context.Context, side pricing.Side, size decimal.Deci
 	}
 }
 
-// call packs the given method's params, fires an eth_call to QuoterV2 at
-// latest state, and returns the unpacked outputs.
+// call packs the given method's params, fires an eth_call to QuoterV2
+// at latest state, and returns the unpacked outputs. Retry on
+// transient transport failures lives in the underlying http.Client's
+// transport; JSON-RPC application errors (execution reverted etc.)
+// arrive here verbatim because the transport sees a 200 OK response
+// and does not retry on the body's error field.
 func (c *Client) call(ctx context.Context, method string, params any) ([]any, error) {
 	data, err := c.abi.Pack(method, params)
 	if err != nil {

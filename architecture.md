@@ -297,9 +297,11 @@ The pipeline downstream of the adapters is split into two components: the **Path
 
 ### 6. Resilience is wrapped, not embedded
 
-Rate limiting, circuit breaking, retries, and structured logging are **middleware** around adapter calls, not concerns inside each adapter. The Binance client just makes HTTP requests; a wrapper enforces the rate limit. The Uniswap client just makes `eth_call` requests; the same wrapper pattern applies.
+Rate limiting, circuit breaking, and retries are **middleware around the external dependency**, not concerns inside each adapter. The Binance client just makes HTTP requests; the Uniswap client just makes `eth_call` requests; both go through a `*http.Client` whose transport composes the resilience layers.
 
-This makes resilience composable and testable in isolation. The same circuit-breaker logic applies to any new adapter for free.
+The composition lives at the HTTP transport, **per external host** — not at the Snapshotter (logical-operation) level. Per-host is the natural granularity because the constraints (the venue's rate budget, the venue's health) are per-dependency: rate-limit at HTTP-call layer means each retry consumes exactly one token (no amplification during failure bursts), and breaker at HTTP-call layer means a future Snapshotter that aggregates multiple endpoints can still return partial results when only one is sick. See [`implementation.md`](./implementation.md#resilience-composition-pattern) for the four-layer stack (retry ▸ breaker ▸ rate-limit ▸ raw) and the reasoning behind the order.
+
+This makes resilience composable and testable in isolation. The same `resilience.NewHTTPClient` factory works for any new HTTP-speaking adapter for free.
 
 ### 7. Single binary, single process
 

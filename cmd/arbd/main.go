@@ -10,12 +10,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"math/big"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/joho/godotenv"
 	"github.com/shopspring/decimal"
@@ -26,6 +28,15 @@ import (
 	"github.com/FrancoLiberali/terrace-challenge/internal/dex/uniswapv3"
 	"github.com/FrancoLiberali/terrace-challenge/internal/pathfinder"
 	"github.com/FrancoLiberali/terrace-challenge/internal/pipeline"
+	"github.com/FrancoLiberali/terrace-challenge/internal/resilience"
+)
+
+// Venue identifiers used across map keys, log fields, breaker labels,
+// and the "venues" list — the canonical names the rest of the bot
+// refers to each integration by.
+const (
+	venueBinance = "binance"
+	venueUniswap = "uniswap"
 )
 
 // Hardcoded for now; configuration lands in Step 7.
@@ -49,22 +60,57 @@ var (
 
 func main() {
 	if err := run(); err != nil {
-		log.Fatalf("arbd: %v", err)
+		slog.Error("arbd exiting with error", "err", err)
+		os.Exit(1)
 	}
 }
 
-func run() error {
+type envConfig struct {
+	httpURL string
+	wsURL   string
+	pretty  bool
+	level   slog.Level
+}
+
+func loadEnv() (envConfig, error) {
 	if err := godotenv.Load(); err != nil {
-		return fmt.Errorf("load .env: %w", err)
+		return envConfig{}, fmt.Errorf("load .env: %w", err)
 	}
-	httpURL := os.Getenv("ETH_RPC_URL")
-	if httpURL == "" {
-		return errors.New("ETH_RPC_URL is not set in .env (see README.md)")
+	cfg := envConfig{
+		httpURL: os.Getenv("ETH_RPC_URL"),
+		wsURL:   os.Getenv("ETH_RPC_WS_URL"),
 	}
-	wsURL := os.Getenv("ETH_RPC_WS_URL")
-	if wsURL == "" {
-		return errors.New("ETH_RPC_WS_URL is not set in .env (see README.md)")
+	if cfg.httpURL == "" {
+		return envConfig{}, errors.New("ETH_RPC_URL is not set in .env (see README.md)")
 	}
+	if cfg.wsURL == "" {
+		return envConfig{}, errors.New("ETH_RPC_WS_URL is not set in .env (see README.md)")
+	}
+	if raw := os.Getenv("LOG_LEVEL"); raw != "" {
+		if err := cfg.level.UnmarshalText([]byte(raw)); err != nil {
+			return envConfig{}, fmt.Errorf("invalid LOG_LEVEL %q: %w", raw, err)
+		}
+	}
+	if raw := os.Getenv("PRETTY_ALERTS"); raw != "" {
+		p, err := strconv.ParseBool(raw)
+		if err != nil {
+			return envConfig{}, fmt.Errorf("invalid PRETTY_ALERTS %q: %w", raw, err)
+		}
+		cfg.pretty = p
+	}
+	return cfg, nil
+}
+
+func run() error {
+	cfg, err := loadEnv()
+	if err != nil {
+		return err
+	}
+	slog.SetDefault(slog.New(newSlogHandler(cfg.pretty, &slog.HandlerOptions{Level: cfg.level})))
+
+	// alertLogger emits unconditionally — the alert is the bot's
+	// product, so LOG_LEVEL must not be able to suppress it.
+	alertLogger := slog.New(newSlogHandler(cfg.pretty, nil))
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -72,12 +118,25 @@ func run() error {
 	// Subscriber → Dispatcher → Pathfinder is a three-stage pipeline,
 	// each stage running in its own goroutine. The main goroutine
 	// consumes candidates and applies the cost model inline.
-	sub := chain.NewSubscriber(wsURL)
-
-	binanceClient := binance.NewClient(binance.DefaultBaseURL)
+	sub := chain.NewSubscriber(cfg.wsURL)
+	binanceHTTP := resilience.NewHTTPClient(resilience.HTTPClientConfig{
+		Retry:          resilience.DefaultRetryConfig(),
+		Limiter:        resilience.NewRateLimiter(venueBinance, 5, 2),
+		Breaker:        newBreaker(venueBinance),
+		RequestTimeout: 10 * time.Second,
+		Logger:         slog.Default(),
+	})
+	binanceClient := binance.NewClientWithHTTP(binance.DefaultBaseURL, binanceHTTP)
 	binanceSn := pipeline.NewBinanceSnapshotter(binanceClient, binance.SymbolETHUSDC, tradeSizes)
 
-	uniswapClient, err := uniswapv3.NewClient(httpURL)
+	uniswapHTTP := resilience.NewHTTPClient(resilience.HTTPClientConfig{
+		Retry:          resilience.DefaultRetryConfig(),
+		Limiter:        resilience.NewRateLimiter(venueUniswap, 10, 10),
+		Breaker:        newBreaker(venueUniswap),
+		RequestTimeout: 10 * time.Second,
+		Logger:         slog.Default(),
+	})
+	uniswapClient, err := uniswapv3.NewClientWithHTTP(cfg.httpURL, uniswapHTTP)
 	if err != nil {
 		return fmt.Errorf("connect to RPC: %w", err)
 	}
@@ -85,8 +144,8 @@ func run() error {
 	uniswapSn := pipeline.NewUniswapSnapshotter(uniswapClient, uniswapv3.PoolETHUSDC03, tradeSizes)
 
 	disp := pipeline.NewDispatcher(map[string]pipeline.Snapshotter{
-		"binance": binanceSn,
-		"uniswap": uniswapSn,
+		venueBinance: binanceSn,
+		venueUniswap: uniswapSn,
 	})
 	pf := pathfinder.NewPathfinder()
 	ev := arbitrage.NewEvaluator(defaultCostModel)
@@ -98,22 +157,46 @@ func run() error {
 	pfErr := make(chan error, 1)
 	go func() { pfErr <- pf.Run(ctx, disp.Results()) }()
 
-	fmt.Fprintf(os.Stdout,
-		"arbd: detecting CEX↔DEX arbitrage on ETH-USDC (binance + uniswap v3 0.3%%)\n"+
-			"      threshold: net profit > $%s USDC — Ctrl+C to stop\n\n",
-		defaultCostModel.MinNetProfitUSDC.String(),
+	slog.Info("arbd starting",
+		"venues", []string{venueBinance, venueUniswap},
+		"pair", "ETH-USDC",
+		"dex_pool", "uniswap_v3_0.3pct",
+		"threshold_usdc", defaultCostModel.MinNetProfitUSDC.String(),
 	)
+	if cfg.pretty {
+		fmt.Fprintf(os.Stdout,
+			"arbd: detecting CEX↔DEX arbitrage on ETH-USDC (binance + uniswap v3 0.3%%)\n"+
+				"      threshold: net profit > $%s USDC — Ctrl+C to stop\n\n",
+			defaultCostModel.MinNetProfitUSDC.String(),
+		)
+	}
 
-	consume(os.Stdout, pf.Candidates(), ev)
+	consume(os.Stdout, pf.Candidates(), ev, cfg.pretty, alertLogger)
 
 	return awaitShutdown(subErr, dispErr, pfErr)
 }
 
-// consume drives the final stage of the pipeline: for every CandidatePath
-// the Pathfinder emits, evaluate it against the cost model and print a
-// structured alert when net profit clears the threshold. Returns when
-// the upstream channel closes (i.e., the Pathfinder's Run has returned).
-func consume(w io.Writer, candidates <-chan pathfinder.CandidatePath, ev *arbitrage.Evaluator) {
+func newSlogHandler(pretty bool, opts *slog.HandlerOptions) slog.Handler {
+	if pretty {
+		return slog.NewTextHandler(os.Stderr, opts)
+	}
+	return slog.NewJSONHandler(os.Stderr, opts)
+}
+
+func newBreaker(venue string) *resilience.CircuitBreaker {
+	return resilience.NewCircuitBreaker(resilience.BreakerConfig{
+		Name:         venue,
+		MinRequests:  20,
+		FailureRatio: 0.2,
+		Cooldown:     30 * time.Second,
+		Interval:     time.Minute,
+		OnStateChange: func(name, from, to string) {
+			slog.Warn("circuit breaker state change", "venue", name, "from", from, "to", to)
+		},
+	})
+}
+
+func consume(w io.Writer, candidates <-chan pathfinder.CandidatePath, ev *arbitrage.Evaluator, pretty bool, alertLogger *slog.Logger) {
 	total, profitable := 0, 0
 	for path := range candidates {
 		total++
@@ -122,9 +205,32 @@ func consume(w io.Writer, candidates <-chan pathfinder.CandidatePath, ev *arbitr
 			continue
 		}
 		profitable++
+		emitOpportunity(w, op, pretty, alertLogger)
+	}
+	slog.Info("evaluation finished", "total_candidates", total, "profitable", profitable)
+}
+
+func emitOpportunity(w io.Writer, op arbitrage.Opportunity, pretty bool, alertLogger *slog.Logger) {
+	alertLogger.Info("arbitrage opportunity detected",
+		"block", op.Block.Number,
+		"timestamp", op.Block.Timestamp.Format("2006-01-02T15:04:05Z"),
+		"direction", op.BuyVenue+"→"+op.SellVenue,
+		"buy_venue", op.BuyVenue,
+		"sell_venue", op.SellVenue,
+		"size_eth", op.Size.String(),
+		"buy_price_usdc", op.BuyPrice.StringFixed(4),
+		"sell_price_usdc", op.SellPrice.StringFixed(4),
+		"spread_per_unit", op.SpreadPerUnit.StringFixed(4),
+		"gross_profit_usdc", op.GrossProfit.StringFixed(2),
+		"gas_cost_usdc", op.GasCostUSDC.StringFixed(4),
+		"gas_estimate", op.GasEstimate,
+		"net_profit_usdc", op.NetProfit.StringFixed(2),
+		"net_profit_pct", op.NetProfitPct.StringFixed(4),
+		"capital_usdc", op.CapitalUSDC.StringFixed(2),
+	)
+	if pretty {
 		printOpportunity(w, op)
 	}
-	fmt.Fprintf(w, "\narbd: evaluated %d candidates, emitted %d above threshold\n", total, profitable)
 }
 
 // awaitShutdown collects each pipeline stage's Run result. ctx-cancel

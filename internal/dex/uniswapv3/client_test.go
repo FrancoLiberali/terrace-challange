@@ -10,12 +10,15 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/shopspring/decimal"
 
 	"github.com/FrancoLiberali/terrace-challenge/internal/pricing"
+	"github.com/FrancoLiberali/terrace-challenge/internal/resilience"
 )
 
 // newQuoterServer stands up a fake JSON-RPC server that recognizes
@@ -289,5 +292,91 @@ func TestEffectivePrices_PerRowFailureWhenRPCErrors(t *testing.T) {
 	}
 	if quotes.Buy[0].Err == nil {
 		t.Errorf("expected Buy[0].Err to be set, got nil")
+	}
+}
+
+func TestEffectivePrices_TransportRetriesOnTransient5xx(t *testing.T) {
+	// Wire NewClientWithHTTP with a resilience.NewHTTPClient that
+	// retries on transient 5xx. The server returns 503 for the first
+	// two hits, then a normal quoter response; both Buy and Sell legs
+	// should succeed via transport-layer retry.
+	sellOut := packOutputs(t, "quoteExactInputSingle", big.NewInt(1_700_000_000), 0)
+	buyOut := packOutputs(t, "quoteExactOutputSingle", big.NewInt(1_710_000_000), 0)
+
+	parsed, err := abi.JSON(strings.NewReader(quoterV2ABI))
+	if err != nil {
+		t.Fatalf("parse ABI: %v", err)
+	}
+	sellID := parsed.Methods["quoteExactInputSingle"].ID
+	buyID := parsed.Methods["quoteExactOutputSingle"].ID
+
+	var hits atomic.Int32
+	const initialFails = 2
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hits.Add(1) <= initialFails {
+			http.Error(w, "boom", http.StatusServiceUnavailable)
+			return
+		}
+		var req struct {
+			ID     json.RawMessage   `json:"id"`
+			Params []json.RawMessage `json:"params"`
+		}
+		if decodeErr := json.NewDecoder(r.Body).Decode(&req); decodeErr != nil {
+			t.Errorf("decode request: %v", decodeErr)
+			return
+		}
+		var msg struct {
+			Input string `json:"input"`
+			Data  string `json:"data"`
+		}
+		_ = json.Unmarshal(req.Params[0], &msg)
+		hexData := msg.Input
+		if hexData == "" {
+			hexData = msg.Data
+		}
+		callData, _ := hex.DecodeString(strings.TrimPrefix(hexData, "0x"))
+		var out []byte
+		switch {
+		case bytes.Equal(callData[:4], sellID):
+			out = sellOut
+		case bytes.Equal(callData[:4], buyID):
+			out = buyOut
+		default:
+			t.Errorf("unknown selector 0x%x", callData[:4])
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      req.ID,
+			"result":  "0x" + hex.EncodeToString(out),
+		})
+	}))
+	defer srv.Close()
+
+	httpClient := resilience.NewHTTPClient(resilience.HTTPClientConfig{
+		Retry: &resilience.RetryConfig{
+			MaxRetries:  3,
+			InitialWait: 5 * time.Millisecond,
+			MaxWait:     20 * time.Millisecond,
+		},
+		RequestTimeout: 2 * time.Second,
+	})
+	client, err := NewClientWithHTTP(srv.URL, httpClient)
+	if err != nil {
+		t.Fatalf("NewClientWithHTTP: %v", err)
+	}
+	defer client.Close()
+
+	quotes, err := client.EffectivePrices(t.Context(), PoolETHUSDC03, []decimal.Decimal{dec("1")})
+	if err != nil {
+		t.Fatalf("EffectivePrices: %v", err)
+	}
+	if quotes.Buy[0].Err != nil {
+		t.Errorf("expected clean Buy quote after retry, got Err=%v", quotes.Buy[0].Err)
+	}
+	if quotes.Sell[0].Err != nil {
+		t.Errorf("expected clean Sell quote after retry, got Err=%v", quotes.Sell[0].Err)
+	}
+	if got := hits.Load(); got <= 2 {
+		t.Errorf("server should have been hit more than 2 times after retries, got %d", got)
 	}
 }

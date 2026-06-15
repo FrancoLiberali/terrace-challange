@@ -5,23 +5,20 @@
 // across a reconnect can compute that from BlockEvent.Number themselves
 // — the subscriber does not interpret the stream.
 //
-// Reconnects use a small constant delay between attempts — just enough to
-// avoid hammering the node during a sustained outage. The proper
-// exponential-backoff-with-jitter (and the wider resilience layer: rate
-// limiting, circuit breaking, retry on transient errors) will land in
-// Step 6 (see plan.md / architecture.md), at which point the chain
-// subscriber will use the same shared backoff utility as the adapter
-// wrappers.
+// Reconnects use exponential backoff with jitter (cenkalti/backoff/v5)
+// so a sustained outage of the WebSocket endpoint doesn't translate
+// into a thundering-herd of redial attempts.
 package chain
 
 import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"math/big"
 	"time"
 
+	"github.com/cenkalti/backoff/v5"
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
@@ -64,24 +61,26 @@ type Subscriber struct {
 	dial dialer
 	out  chan BlockEvent
 
-	// reconnectDelay is the wait between reconnect attempts. NewSubscriber
-	// sets a sane default; tests in this package override it directly to
-	// keep the suite fast.
-	reconnectDelay time.Duration
-
-	logger *log.Logger
+	// reconnectInitialDelay / reconnectMaxDelay bound the exponential
+	// backoff between dial attempts. NewSubscriber sets sane defaults;
+	// tests in this package override directly to keep the suite fast.
+	reconnectInitialDelay time.Duration
+	reconnectMaxDelay     time.Duration
 }
 
-const defaultReconnectDelay = 1 * time.Second
+const (
+	defaultReconnectInitialDelay = 1 * time.Second
+	defaultReconnectMaxDelay     = 30 * time.Second
+)
 
 // NewSubscriber returns a Subscriber bound to the given WebSocket RPC URL.
 // Call Events() once for the output stream, then Run(ctx) to drive it.
 func NewSubscriber(wsURL string) *Subscriber {
 	return &Subscriber{
-		dial:           &ethDialer{url: wsURL},
-		out:            make(chan BlockEvent),
-		reconnectDelay: defaultReconnectDelay,
-		logger:         log.Default(),
+		dial:                  &ethDialer{url: wsURL},
+		out:                   make(chan BlockEvent),
+		reconnectInitialDelay: defaultReconnectInitialDelay,
+		reconnectMaxDelay:     defaultReconnectMaxDelay,
 	}
 }
 
@@ -126,18 +125,22 @@ func (s *Subscriber) Run(ctx context.Context) error {
 		// and the next dial often succeeds immediately. The
 		// reconnectDelay only applies to *dial-failure* retries inside
 		// dialWithRetry.
-		s.logger.Printf("chain: subscription dropped: %v; reconnecting", err)
+		slog.Warn("subscription dropped — reconnecting", "err", err)
 	}
 }
 
-// dialWithRetry returns a live subscription, retrying after reconnectDelay
-// on any non-ctx error. The retry loop is self-contained so Run() reads
-// as a clean three-step state machine (dial → stream → reconnect).
+// dialWithRetry returns a live subscription, retrying with exponential
+// backoff and jitter on any non-ctx error. The retry loop is
+// self-contained so Run() reads as a clean three-step state machine
+// (dial → stream → reconnect).
 //
 // Returns (sub, nil) on success. Returns (nil, err) only when ctx is
 // cancelled or its deadline expires — at which point Run() propagates
 // the error up to the caller and shuts down.
 func (s *Subscriber) dialWithRetry(ctx context.Context) (subscription, error) {
+	b := backoff.NewExponentialBackOff()
+	b.InitialInterval = s.reconnectInitialDelay
+	b.MaxInterval = s.reconnectMaxDelay
 	for {
 		sub, err := s.dial.Dial(ctx)
 		if err == nil {
@@ -150,11 +153,12 @@ func (s *Subscriber) dialWithRetry(ctx context.Context) (subscription, error) {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return nil, err
 		}
-		s.logger.Printf("chain: dial failed: %v; retrying in %v", err, s.reconnectDelay)
+		delay := b.NextBackOff()
+		slog.Warn("dial failed — retrying", "err", err, "delay", delay)
 		// sleepCtx returns false if ctx fires before the delay elapses,
 		// meaning the consumer cancelled mid-backoff — bow out with the
 		// ctx error rather than redialing.
-		if !sleepCtx(ctx, s.reconnectDelay) {
+		if !sleepCtx(ctx, delay) {
 			return nil, ctx.Err()
 		}
 	}

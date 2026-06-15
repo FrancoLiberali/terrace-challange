@@ -62,6 +62,15 @@ linters:
           paramsOnly: false
         underef:
           skipRecvDeref: false
+    goconst:
+      # Test fixtures may legitimately repeat string literals (mock
+      # responses, expected error substrings, table-driven cases). The
+      # _test.go path-exclusion only suppresses the *report*; goconst
+      # still counts test occurrences when deciding to flag a
+      # production file. ignore-tests excludes them from the count
+      # entirely, so a string used 1× in production + N× in tests
+      # doesn't surface as a goconst issue against the production file.
+      ignore-tests: true
     govet:
       enable-all: true
       disable:
