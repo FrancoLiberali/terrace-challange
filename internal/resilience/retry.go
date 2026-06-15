@@ -98,57 +98,6 @@ func NewHTTPClient(cfg HTTPClientConfig) *http.Client {
 	return c.StandardClient()
 }
 
-// rateLimitTransport gates each outbound request through the limiter
-// before delegating to the inner transport.
-type rateLimitTransport struct {
-	inner   http.RoundTripper
-	limiter *RateLimiter
-}
-
-func (t *rateLimitTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if err := t.limiter.Wait(req.Context()); err != nil {
-		return nil, err
-	}
-	return t.inner.RoundTrip(req)
-}
-
-// circuitBreakerTransport gates each outbound request through the
-// breaker. When the breaker is open the request short-circuits with
-// gobreaker.ErrOpenState (which surfaces unchanged to the retry
-// layer so it can be classified as permanent).
-//
-// 5xx responses are reported to the breaker as failures even though
-// Go's HTTP semantics surface them as (resp, nil). Without this, a
-// server consistently returning 500 would never trip the breaker. The
-// 5xx marker error is swallowed on the way out so the response itself
-// still flows upstream — retryablehttp's CheckRetry will see the 5xx
-// status and decide whether to retry.
-type circuitBreakerTransport struct {
-	inner   http.RoundTripper
-	breaker *CircuitBreaker
-}
-
-var errServerError = errors.New("server returned 5xx")
-
-func (t *circuitBreakerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	var resp *http.Response
-	err := t.breaker.Execute(req.Context(), func() error {
-		r, e := t.inner.RoundTrip(req) //nolint:bodyclose // transport passes the body upstream; caller owns Close
-		resp = r
-		if e != nil {
-			return e
-		}
-		if r != nil && r.StatusCode >= http.StatusInternalServerError {
-			return errServerError
-		}
-		return nil
-	})
-	if errors.Is(err, errServerError) {
-		return resp, nil
-	}
-	return resp, err
-}
-
 // slogLeveledLogger adapts an *slog.Logger to retryablehttp's
 // LeveledLogger interface. Used internally by NewRetryingHTTPClient
 // so retry decisions are visible in the structured-log stream when a

@@ -9,6 +9,7 @@ package resilience
 import (
 	"context"
 	"log/slog"
+	"net/http"
 	"time"
 
 	// Token-bucket rate limiter from the golang.org/x sub-repo.
@@ -49,4 +50,18 @@ func (r *RateLimiter) Wait(ctx context.Context) error {
 		slog.DebugContext(ctx, "rate-limit wait", "venue", r.name, "wait_ms", elapsed.Milliseconds())
 	}
 	return err
+}
+
+// rateLimitTransport gates each outbound HTTP request through the
+// limiter before delegating to the inner transport.
+type rateLimitTransport struct {
+	inner   http.RoundTripper
+	limiter *RateLimiter
+}
+
+func (t *rateLimitTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if err := t.limiter.Wait(req.Context()); err != nil {
+		return nil, err
+	}
+	return t.inner.RoundTrip(req)
 }

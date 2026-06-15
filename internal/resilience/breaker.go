@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/http"
 	"time"
 
 	// Classic 3-state circuit breaker from Sony; minimal API, zero
@@ -86,4 +87,41 @@ func (b *CircuitBreaker) Execute(ctx context.Context, op func() error) error {
 		slog.DebugContext(ctx, "circuit breaker rejected call", "venue", b.inner.Name())
 	}
 	return err
+}
+
+// circuitBreakerTransport gates each outbound HTTP request through the
+// breaker. When the breaker is open the request short-circuits with
+// gobreaker.ErrOpenState (which surfaces unchanged to the retry layer
+// so it can be classified as permanent).
+//
+// 5xx responses are reported to the breaker as failures even though
+// Go's HTTP semantics surface them as (resp, nil). Without this, a
+// server consistently returning 500 would never trip the breaker. The
+// 5xx marker error is swallowed on the way out so the response itself
+// still flows upstream — retryablehttp's CheckRetry will see the 5xx
+// status and decide whether to retry.
+type circuitBreakerTransport struct {
+	inner   http.RoundTripper
+	breaker *CircuitBreaker
+}
+
+var errServerError = errors.New("server returned 5xx")
+
+func (t *circuitBreakerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	var resp *http.Response
+	err := t.breaker.Execute(req.Context(), func() error {
+		r, e := t.inner.RoundTrip(req) //nolint:bodyclose // transport passes the body upstream; caller owns Close
+		resp = r
+		if e != nil {
+			return e
+		}
+		if r != nil && r.StatusCode >= http.StatusInternalServerError {
+			return errServerError
+		}
+		return nil
+	})
+	if errors.Is(err, errServerError) {
+		return resp, nil
+	}
+	return resp, err
 }
