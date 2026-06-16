@@ -29,7 +29,6 @@ The architecture is deliberately a **single Go process** with no message broker 
   - [Horizontal scaling per adapter](#horizontal-scaling-per-adapter)
   - [Pathfinder and Evaluator as stateless consumers](#pathfinder-and-evaluator-as-stateless-consumers)
   - [Multi-feature evolution: stateful market graph + per-service derived state](#multi-feature-evolution-stateful-market-graph--per-service-derived-state)
-  - [State and history store](#state-and-history-store)
   - [Observability stack](#observability-stack)
   - [Other production concerns](#other-production-concerns)
 
@@ -377,13 +376,6 @@ The thing that does not scale in the present single-feature design is the explic
 **Each algorithm or feature owns its own derived state.** The thing shared across services is the broker event stream, not a single graph instance. Each consumer materializes the projection of the graph that's optimized for its query pattern — the arb detector indexes cycles, the router indexes adjacency lists, the price oracle indexes per-pair mid-prices, the archive appends-only — all from the same upstream stream of normalized market-data events. This keeps the failure and scaling boundaries per-feature: any service can be scaled, redeployed, or rebuilt from the event log without touching the others.
 
 The dispatcher / `pricing.Quote` / per-venue snapshotter shapes carry over unchanged into that world; the Pathfinder shape is the part that gets replaced.
-
-### State and history store
-
-Two persistent stores would be added:
-
-- **Operational state** (PostgreSQL or Redis): last-processed block per chain, current circuit-breaker states, rate-limit counters. Survives restarts.
-- **Detection history** (time-series DB such as ClickHouse, or append-only Postgres): every detected opportunity, every snapshot, every rejected near-miss. Enables analytics ("what's our detection rate by hour?", "which venues consistently provide the best DEX side?") and supports backtesting.
 
 ### Observability stack
 
