@@ -41,7 +41,7 @@ The system is built around the **synchronized snapshot per block** pattern motiv
 2. The snapshot coordinator dispatches one unit of work to each registered venue adapter in parallel — *"produce effective prices for this pair at the configured trade sizes."*
 3. Each adapter handles its venue's optimal access pattern internally (the CEX does one fetch and walks the book per size; the DEX does one simulated swap per size) and returns a **unified effective-price list** — the same shape from both venues, slippage-aware, fee-adjusted.
 4. The Pathfinder enumerates **candidate paths** from the paired effective-price data — each path is a fully-specified prospective arbitrage trade (size, buy venue, sell venue, observed prices).
-5. The Profitability Evaluator applies CEX trading fees and gas estimates to each candidate, and emits a structured opportunity when the net spread crosses the configured threshold.
+5. The Profitability Evaluator applies the gas estimate to each candidate (CEX trading fees and DEX pool fees are already folded into the effective prices at the adapter boundary, per step 3) and emits a structured opportunity when the net spread crosses the configured threshold.
 6. The output sink formats and emits each opportunity.
 
 Pricing math (orderbook walking, quote-to-unit-price conversion) sits within the adapter layer as a shared concern — applied by each adapter as part of producing its output, not as a separate pipeline stage between adapters and detector. The shape that emerges at the adapter boundary is the unified one; nothing downstream needs to perform further normalization.
