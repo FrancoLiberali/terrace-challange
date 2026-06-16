@@ -15,7 +15,6 @@ The architecture is deliberately a **single Go process** with no message broker 
   - [2. Block dispatch: streaming over synchronous coordination](#2-block-dispatch-streaming-over-synchronous-coordination)
     - [Chosen: streaming Dispatcher (`internal/pipeline`)](#chosen-streaming-dispatcher-internalpipeline)
     - [Alternative: synchronous Coordinator with cancel-on-supersession](#alternative-synchronous-coordinator-with-cancel-on-supersession)
-    - [Why we picked streaming](#why-we-picked-streaming)
     - [Other alternatives considered](#other-alternatives-considered)
   - [3. Adapters emit a unified effective-price shape](#3-adapters-emit-a-unified-effective-price-shape)
   - [4. Adapters own multi-size handling internally](#4-adapters-own-multi-size-handling-internally)
@@ -184,6 +183,8 @@ The Dispatcher fans block events out to per-venue Snapshotters and forwards thei
 - **Strict freshness ("only the latest block ever surfaces") is not enforced** by the Dispatcher. The publisher of a broker `blocks` topic cannot reach into subscriber processes to cancel in-flight work, so a Dispatcher that mirrors that constraint cannot cancel either. Stale results from block N may appear after block N+1's results have already gone out.
 - The synchronous correctness invariant must be re-implemented downstream if needed (see below).
 
+The cost we accept: freshness is not enforced today. If it becomes important, the natural place is a Pathfinder freshness filter (Step 5) — the Pathfinder already tracks the latest block it has seen, so dropping older results is a one-line addition. A stateful-Snapshotter wrapper (subscriber-side cancellation) is also possible as a decorator, but the Pathfinder filter is the load-bearing fix because race windows let stale results slip past any subscriber-side cancel.
+
 #### Alternative: synchronous Coordinator with cancel-on-supersession
 
 The Coordinator reads BlockEvents, fans out to each adapter, `wg.Wait()`s for all of them, and emits a single paired `Snapshot{Block, CEX, DEX, CEXErr, DEXErr}`. Each block has its own context; arrival of block N+1 cancels block N's context, aborting in-flight calls.
@@ -198,16 +199,6 @@ The Coordinator reads BlockEvents, fans out to each adapter, `wg.Wait()`s for al
 
 - **Wait-for-slowest** scales poorly: at N venues, the slowest gates the others. Acceptable at 2; degraded at 5+.
 - **Does not migrate to a broker shape** without restructuring — the whole `wg.Wait` + central-emit pattern is a single-process artifact.
-
-#### Why we picked streaming
-
-Three reasons, in order of weight:
-
-1. **The challenge's "multi-venue extension" discussion point is real.** Choosing streaming means the answer to "how would you scale to N venues?" is "the architecture already does this; here's how." Synchronous-only would force a hypothetical answer.
-2. **Per-venue latency independence is a genuine runtime benefit**, not just a future-proofing argument. As soon as one venue's API degrades (Binance rate limit, Alchemy lag), the streaming design keeps the other venue's results flowing.
-3. **Alignment with the broker section of this document.** The production-scale design described later in this doc replaces the in-process Pipeline with a broker pub/sub. The streaming shape mirrors that data flow; the synchronous Coordinator does not. Keeping them aligned avoids a future "rewrite the dispatch layer when you add a broker."
-
-The cost we accept: freshness is not enforced today. If it becomes important, the natural place is a Pathfinder freshness filter (Step 5) — the Pathfinder already tracks the latest block it has seen, so dropping older results is a one-line addition. A stateful-Snapshotter wrapper (subscriber-side cancellation) is also possible as a decorator, but the Pathfinder filter is the load-bearing fix because race windows let stale results slip past any subscriber-side cancel.
 
 #### Other alternatives considered
 
