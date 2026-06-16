@@ -49,18 +49,16 @@ terrace-challenge/
 │   │   └── uniswap.go                # Uniswap Snapshotter implementation
 │   ├── pathfinder/pathfinder.go      # candidate-path enumeration (pure)
 │   ├── arbitrage/evaluator.go        # cost model → Opportunity (pure)
+│   ├── alert/textsink.go             # structured + optional pretty output
+│   ├── config/config.go              # YAML loader (config.yaml)
 │   └── resilience/
 │       ├── ratelimit.go              # token bucket (wraps x/time/rate)
 │       ├── breaker.go                # circuit breaker (wraps gobreaker)
 │       └── retry.go                  # NewHTTPClient + transport wrappers
+├── config.yaml
 ├── go.mod
 └── (docs at repo root)
 ```
-
-Config loading and a YAML format are deferred to Step 7. Alert output
-lives directly in `cmd/arbd/main.go` (`emitOpportunity` →
-structured `slog.Info` + optional pretty block) — an injectable
-`OpportunitySink` interface would be premature for a single output.
 
 ---
 
